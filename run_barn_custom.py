@@ -30,7 +30,7 @@ from configs.config import Paths, WorldConfig, GazeboConfig, NavConfig, apply_en
 
 # gazebo_simulation.py lives in the-barn-challenge; add it to path
 sys.path.insert(0, Paths.BARN_CHALLENGE)
-from gazebo_simulation import GazeboSimulation
+from gazebo.gazebo_simulation import GazeboSimulation
 
 INIT_POSITION = WorldConfig.STATIC_INIT_POSITION
 GOAL_POSITION = WorldConfig.STATIC_GOAL_OFFSET
