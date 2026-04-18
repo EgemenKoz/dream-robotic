@@ -75,14 +75,14 @@ if __name__ == "__main__":
     if not (0 <= args.world_idx <= 299):
         raise ValueError("world_idx must be 0-299 (only static BARN worlds supported here)")
 
-    # Ensure child processes are always terminated on Ctrl+C or SIGTERM
+    # Ensure child processes are always terminated on Ctrl+C or SIGTERM.
+    # _stop is set by the signal handler so the main loop can exit cleanly
+    # and still write logs before shutting down.
     gazebo_process = None
     nav_stack_process = None
+    _stop = [False]   # list so the nested function can mutate it without nonlocal
 
-    def _shutdown(sig, frame):
-        print("\nShutting down...")
-        # Send SIGINT first — gives roslaunch a chance to cleanly stop nodes
-        # (avoids segfault from GPU plugins being killed mid-frame via SIGTERM)
+    def _kill_procs():
         for proc in [nav_stack_process, gazebo_process]:
             if proc is None:
                 continue
@@ -94,7 +94,10 @@ if __name__ == "__main__":
                 proc.wait()
             except OSError:
                 pass
-        sys.exit(0)
+
+    def _shutdown(sig, frame):
+        print("\nShutdown requested — finishing log then exiting...")
+        _stop[0] = True   # signals the monitoring loop to break
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -213,7 +216,7 @@ if __name__ == "__main__":
     curr_coor = (pos.x, pos.y)
 
     # Wait for robot to start moving
-    while compute_distance(init_coor, curr_coor) < 0.1:
+    while compute_distance(init_coor, curr_coor) < 0.1 and not _stop[0]:
         curr_time = rospy.get_time()
         pos = gazebo_sim.get_model_state().pose.position
         curr_coor = (pos.x, pos.y)
@@ -222,13 +225,16 @@ if __name__ == "__main__":
     start_time = curr_time
     collided = False
 
-    while compute_distance(goal_coor, curr_coor) > NavConfig.GOAL_TOLERANCE and not collided and curr_time - start_time < NavConfig.TIMEOUT:
+    while (compute_distance(goal_coor, curr_coor) > NavConfig.GOAL_TOLERANCE
+           and not collided
+           and curr_time - start_time < NavConfig.TIMEOUT
+           and not _stop[0]):
         curr_time = rospy.get_time()
         pos = gazebo_sim.get_model_state().pose.position
         curr_coor = (pos.x, pos.y)
         print("Time: %.2f (s), x: %.2f (m), y: %.2f (m)" % (curr_time - start_time, *curr_coor), end="\r")
         collided = gazebo_sim.get_hard_collision()
-        while rospy.get_time() - curr_time < 0.1:
+        while rospy.get_time() - curr_time < 0.1 and not _stop[0]:
             time.sleep(0.01)
 
     ##########################################################################################
@@ -237,7 +243,9 @@ if __name__ == "__main__":
 
     print("\n>>>>>>>>>>>>>>>>>> Test finished! <<<<<<<<<<<<<<<<<<")
     success = False
-    if collided:
+    if _stop[0] and not collided and compute_distance(goal_coor, curr_coor) > NavConfig.GOAL_TOLERANCE:
+        status = "interrupted"
+    elif collided:
         status = "collided"
     elif curr_time - start_time >= NavConfig.TIMEOUT:
         status = "timeout"
@@ -268,7 +276,9 @@ if __name__ == "__main__":
 
     # ── Results directory ──────────────────────────────────────────────────────
     results_dir = Paths.RESULTS_DIR
+    logs_dir = join(results_dir, "logs")
     os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
 
     # ── Summary file (one line per run, appended) ──────────────────────────────
     if args.out is None:
@@ -307,7 +317,7 @@ if __name__ == "__main__":
 
     # ── Per-run detailed log ───────────────────────────────────────────────────
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = join(results_dir, "world_%03d_%s_%s.log" % (args.world_idx, args.robot, run_ts))
+    log_file = join(logs_dir, "world_%03d_%s_%s.log" % (args.world_idx, args.robot, run_ts))
 
     SEP  = "=" * 72
     THIN = "-" * 72
@@ -370,7 +380,4 @@ if __name__ == "__main__":
     print("Summary  -> %s" % out_file)
     print("Run log  -> %s" % log_file)
 
-    gazebo_process.terminate()
-    gazebo_process.wait()
-    nav_stack_process.terminate()
-    nav_stack_process.wait()
+    _kill_procs()

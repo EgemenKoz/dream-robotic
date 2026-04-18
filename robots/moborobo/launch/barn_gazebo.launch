@@ -46,6 +46,9 @@
        if jackal_ws is not available (collision detection will be inactive). -->
   <node if="$(arg use_collision_publisher)"
         pkg="jackal_helper" type="collision_publisher_node"
-        name="collision_publisher_node" />
+        name="collision_publisher_node">
+    <!-- Tell the publisher to watch "moborobo" not the default "jackal" -->
+    <param name="model_name" value="moborobo" />
+  </node>
 
 </launch>
