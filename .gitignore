@@ -1,6 +1,6 @@
 .claude/
 
-__pycahche__/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -13,3 +13,6 @@ __pycahche__/
 .idea/
 .vscode/
 *.iml
+
+results/
+output/

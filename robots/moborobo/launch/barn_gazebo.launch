@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!--
+  barn_gazebo.launch — Spawn Moborobo in a BARN dataset world.
+
+  Args:
+    world_name  (required) — absolute path to the .world file
+    gui         (default: false) — set true to open the Gazebo GUI
+    headless    (default: true)  — set false when gui is true
+    init_x / init_y / init_z / init_yaw — spawn pose (defaults match BARN start)
+-->
+<launch>
+  <arg name="world_name" />
+  <arg name="gui"                     default="false" />
+  <arg name="headless"                default="true" />
+  <arg name="init_x"                  default="-2.25" />
+  <arg name="init_y"                  default="3.0" />
+  <arg name="init_z"                  default="0.2" />
+  <arg name="init_yaw"                default="1.5708" />
+  <!-- Set false if jackal_ws is not sourced (disables /collision topic) -->
+  <arg name="use_collision_publisher" default="true" />
+
+  <!-- Load moborobo URDF (xacro) into /robot_description -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro '$(find moborobo)/description/robot.udrf.xacro'" />
+
+  <!-- Start Gazebo with the given BARN world -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="gui"          value="$(arg gui)" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="headless"     value="$(arg headless)" />
+    <arg name="world_name"   value="$(arg world_name)" />
+  </include>
+
+  <!-- Spawn the Moborobo model -->
+  <node name="spawn_moborobo" pkg="gazebo_ros" type="spawn_model" output="screen"
+        args="-param robot_description -urdf -model moborobo
+              -x $(arg init_x) -y $(arg init_y) -z $(arg init_z)
+              -Y $(arg init_yaw)" />
+
+  <!-- Publish robot TF from joint states -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher" output="screen" />
+
+  <!-- Collision publisher (reused from jackal_helper).
+       Requires jackal_ws to be sourced. Disable with use_collision_publisher:=false
+       if jackal_ws is not available (collision detection will be inactive). -->
+  <node if="$(arg use_collision_publisher)"
+        pkg="jackal_helper" type="collision_publisher_node"
+        name="collision_publisher_node" />
+
+</launch>

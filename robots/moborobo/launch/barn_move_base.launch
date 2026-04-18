@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!--
+  barn_move_base.launch — Navigation stack for Moborobo in the BARN challenge.
+
+  Starts:
+    1. pointcloud_to_laserscan  — converts RS-16 /rs_points → /scan (2D)
+    2. move_base                — global + local planner using moborobo costmap params
+
+  Both costmaps use global_frame: odom so no localization node (AMCL/gmapping) is
+  required. The navigation goal in run_barn_custom.py is also sent in the odom frame.
+-->
+<launch>
+
+  <!-- Convert RoboSense RS-16 3D point cloud to a 2D LaserScan on /scan -->
+  <node pkg="pointcloud_to_laserscan" type="pointcloud_to_laserscan_node"
+        name="pointcloud_to_laserscan" output="screen">
+    <remap from="cloud_in" to="/rs_points" />
+    <rosparam>
+      target_frame: base_link
+      transform_tolerance: 0.05
+      min_height: 0.0
+      max_height: 1.0
+
+      angle_min: -3.14159
+      angle_max:  3.14159
+      angle_increment: 0.0087
+      scan_time: 0.1
+      range_min: 0.45
+      range_max: 10.0
+      use_inf: true
+      concurrency_level: 1
+    </rosparam>
+  </node>
+
+  <!-- move_base with Moborobo costmap and trajectory planner params -->
+  <node pkg="move_base" type="move_base" name="move_base" output="screen">
+    <param name="controller_frequency" value="10.0" />
+
+    <rosparam file="$(find moborobo)/config/costmap_common_params.yaml"
+              command="load" ns="global_costmap" />
+    <rosparam file="$(find moborobo)/config/costmap_common_params.yaml"
+              command="load" ns="local_costmap" />
+    <rosparam file="$(find moborobo)/config/local_costmap_params.yaml"
+              command="load" />
+    <rosparam file="$(find moborobo)/config/global_costmap_params.yaml"
+              command="load" />
+    <rosparam file="$(find moborobo)/config/trajectory_planner.yaml"
+              command="load" />
+  </node>
+
+</launch>

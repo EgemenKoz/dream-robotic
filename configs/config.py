@@ -2,7 +2,9 @@
 Central configuration for BARN simulation runs.
 
 Import this in any script:
-    from config import RobotConfig, WorldConfig, GazeboConfig, NavConfig
+    from config import SimConfig, RobotConfig, MoboroboConfig, WorldConfig, GazeboConfig, NavConfig
+
+Set SimConfig.ROBOT = "jackal" or "moborobo" to choose the platform.
 """
 
 import os
@@ -18,18 +20,34 @@ class Paths:
     MAP_FILES        = join(BARN_DATASET, "map_files")
     GRID_FILES       = join(BARN_DATASET, "grid_files")
     CSPACE_FILES     = join(BARN_DATASET, "cspace_files")
-    METRICS_FILES    = join(BARN_DATASET, "metrics_files")
+    METRICS_FILES      = join(BARN_DATASET, "metrics_files")
+    NORM_METRICS_FILES = join(BARN_DATASET, "norm_metrics_files")
 
     JACKAL_WS        = "/home/egemen/barn_lab/jackal_ws"
     BARN_CHALLENGE   = join(JACKAL_WS, "src/the-barn-challenge")
     JACKAL_HELPER    = join(BARN_CHALLENGE, "jackal_helper")
 
+    ROBOTS_DIR       = expanduser("~/Desktop/dream/robots")
+    MOBOROBO_PKG     = join(ROBOTS_DIR, "moborobo")
+
     RESULTS_DIR      = expanduser("~/Desktop/dream/results")
+
+
+# ── Robot Selection ────────────────────────────────────────────────────────────
+
+class SimConfig:
+    """Top-level simulation switch. Change ROBOT to select the platform.
+
+    "jackal"   — Clearpath Jackal UGV with Hokuyo UST-10 2D LiDAR (BARN default)
+    "moborobo" — Moborobo robot with RoboSense RS-16 3D LiDAR
+    """
+    ROBOT = "jackal"   # "jackal" | "moborobo"
 
 
 # ── Jackal Robot ───────────────────────────────────────────────────────────────
 
 class RobotConfig:
+    """Configuration for the Clearpath Jackal UGV (BARN challenge default)."""
     # Laser sensor
     LASER_ENABLED    = True
     LASER_MODEL      = "ust10"             # Hokuyo UST-10 (270 deg FoV, 0.05–10 m)
@@ -46,6 +64,53 @@ class RobotConfig:
         [ 0.21,  0.165],
         [ 0.21, -0.165],
     ]
+
+
+# ── Moborobo Robot ─────────────────────────────────────────────────────────────
+
+class MoboroboConfig:
+    """Configuration for the Moborobo robot with RoboSense RS-16 3D LiDAR.
+
+    The RS-16 is a 360-degree 3D LiDAR. In the BARN simulation it is converted
+    to a 2D LaserScan (published on /scan) by the pointcloud_to_laserscan node
+    inside barn_move_base.launch.
+    """
+
+    # RoboSense RS-16 3D LiDAR topics
+    LIDAR_POINTCLOUD_TOPIC = "/rs_points"   # raw point cloud from RS-16 Gazebo plugin
+    LIDAR_SCAN_TOPIC       = "/scan"        # 2D LaserScan after pointcloud_to_laserscan
+    LIDAR_FRAME            = "robosense"
+
+    # pointcloud_to_laserscan filter settings (must match barn_move_base.launch)
+    LIDAR_MIN_RANGE   = 0.45   # m
+    LIDAR_MAX_RANGE   = 10.0   # m
+    LIDAR_HEIGHT_MIN  = 0.0    # m — keep returns between these heights (ground slice)
+    LIDAR_HEIGHT_MAX  = 1.0    # m
+
+    # Physical limits (from trajectory_planner.yaml)
+    MAX_LINEAR_VEL   = 0.2    # m/s
+    MAX_ANGULAR_VEL  = 1.0    # rad/s
+
+    # Footprint (from costmap_common_params.yaml — larger than Jackal)
+    FOOTPRINT = [
+        [ 0.387,  0.235],
+        [ 0.387, -0.235],
+        [-0.387, -0.235],
+        [-0.387,  0.235],
+    ]
+
+    # Gazebo model name (must match -model arg in barn_gazebo.launch)
+    MODEL_NAME = "moborobo"
+
+    @staticmethod
+    def gazebo_launch_file() -> str:
+        """Launch file that spawns Moborobo in a BARN world."""
+        return join(Paths.MOBOROBO_PKG, "launch", "barn_gazebo.launch")
+
+    @staticmethod
+    def nav_launch_file() -> str:
+        """Launch file for Moborobo navigation stack (move_base + sensor converter)."""
+        return join(Paths.MOBOROBO_PKG, "launch", "barn_move_base.launch")
 
 
 # ── World / Environment ────────────────────────────────────────────────────────
@@ -88,6 +153,14 @@ class WorldConfig:
     def cspace_file(world_idx: int) -> str:
         return join(Paths.CSPACE_FILES, "cspace_%d.npy" % world_idx)
 
+    @staticmethod
+    def metrics_file(world_idx: int) -> str:
+        return join(Paths.METRICS_FILES, "metrics_%d.npy" % world_idx)
+
+    @staticmethod
+    def norm_metrics_file(world_idx: int) -> str:
+        return join(Paths.NORM_METRICS_FILES, "norm_metrics_%d.npy" % world_idx)
+
 
 # ── Gazebo Simulation ──────────────────────────────────────────────────────────
 
@@ -129,18 +202,49 @@ class NavConfig:
     DWA_YAW_TOLERANCE= 0.157         # radians (~9 deg)
 
     @staticmethod
-    def launch_file() -> str:
+    def launch_file(robot: str = None) -> str:
+        """Return the navigation launch file for the given robot.
+
+        Args:
+            robot: "jackal" or "moborobo". Defaults to SimConfig.ROBOT.
+        """
+        if robot is None:
+            robot = SimConfig.ROBOT
+        if robot == "moborobo":
+            return MoboroboConfig.nav_launch_file()
+        # jackal — pick DWA or EBand
         base = Paths.JACKAL_HELPER
         if NavConfig.LOCAL_PLANNER == "eband":
             return join(base, "launch", "move_base_eband.launch")
         return join(base, "launch", "move_base_DWA.launch")
 
 
-# ── Apply env vars for Jackal laser (call before roslaunch) ───────────────────
+# ── Apply env vars before roslaunch (call once before spawning Gazebo) ─────────
 
-def apply_env():
-    """Set all required environment variables. Call once before launching Gazebo."""
-    os.environ["JACKAL_LASER"]        = "1" if RobotConfig.LASER_ENABLED else "0"
-    os.environ["JACKAL_LASER_MODEL"]  = RobotConfig.LASER_MODEL
-    os.environ["JACKAL_LASER_OFFSET"] = RobotConfig.LASER_OFFSET
-    os.environ["GAZEBO_PLUGIN_PATH"]  = join(Paths.JACKAL_HELPER, "plugins")
+def apply_env(robot: str = None):
+    """Set required environment variables for the chosen robot.
+
+    Args:
+        robot: "jackal" or "moborobo". Defaults to SimConfig.ROBOT.
+    """
+    if robot is None:
+        robot = SimConfig.ROBOT
+
+    if robot == "jackal":
+        os.environ["JACKAL_LASER"]        = "1" if RobotConfig.LASER_ENABLED else "0"
+        os.environ["JACKAL_LASER_MODEL"]  = RobotConfig.LASER_MODEL
+        os.environ["JACKAL_LASER_OFFSET"] = RobotConfig.LASER_OFFSET
+        os.environ["GAZEBO_PLUGIN_PATH"]  = join(Paths.JACKAL_HELPER, "plugins")
+    elif robot == "moborobo":
+        # The RS-16 plugin is in robots/robosense_simulator/robosense_gazebo_plugins
+        # After building, the .so lands in the catkin devel/lib directory.
+        # GAZEBO_PLUGIN_PATH must include that lib dir so Gazebo can find it.
+        # Adjust this path to wherever catkin built the plugin.
+        robosense_plugin_dir = join(
+            Paths.ROBOTS_DIR, "robosense_simulator",
+            "robosense_gazebo_plugins", "lib"
+        )
+        existing = os.environ.get("GAZEBO_PLUGIN_PATH", "")
+        os.environ["GAZEBO_PLUGIN_PATH"] = (
+            robosense_plugin_dir + ":" + existing if existing else robosense_plugin_dir
+        )

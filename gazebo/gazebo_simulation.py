@@ -8,10 +8,10 @@ from geometry_msgs.msg import Quaternion
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 
-def create_model_state(x, y, z, angle):
+def create_model_state(x, y, z, angle, model_name='jackal'):
     # the rotation of the angle is in (0, 0, 1) direction
     model_state = ModelState()
-    model_state.model_name = 'jackal'
+    model_state.model_name = model_name
     model_state.pose.position.x = x
     model_state.pose.position.y = y
     model_state.pose.position.z = z
@@ -23,14 +23,17 @@ def create_model_state(x, y, z, angle):
 
 class GazeboSimulation():
 
-    def __init__(self, init_position = [0, 0, 0]):
+    def __init__(self, init_position=[0, 0, 0], model_name='jackal'):
         self._pause = rospy.ServiceProxy('/gazebo/pause_physics', Empty)
         self._unpause = rospy.ServiceProxy('/gazebo/unpause_physics', Empty)
         self._reset = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
         self._model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
 
-        self._init_model_state = create_model_state(init_position[0],init_position[1],0,init_position[2])
-        
+        self._model_name = model_name
+        self._init_model_state = create_model_state(
+            init_position[0], init_position[1], 0, init_position[2], model_name
+        )
+
         self.collision_count = 0
         self._collision_sub = rospy.Subscriber("/collision", Bool, self.collision_monitor)
         
@@ -82,13 +85,15 @@ class GazeboSimulation():
     def get_model_state(self):
         rospy.wait_for_service("/gazebo/get_model_state")
         try:
-            return self._model_state('jackal', 'world')
+            return self._model_state(self._model_name, 'world')
         except (rospy.ServiceException):
             rospy.logwarn("/gazebo/get_model_state service call failed")
 
-    def reset_init_model_state(self, init_position = [0, 0, 0]):
+    def reset_init_model_state(self, init_position=[0, 0, 0]):
         """Overwrite the initial model state
         Args:
             init_position (list, optional): initial model state in x, y, z. Defaults to [0, 0, 0].
         """
-        self._init_model_state = create_model_state(init_position[0],init_position[1],0,init_position[2])
+        self._init_model_state = create_model_state(
+            init_position[0], init_position[1], 0, init_position[2], self._model_name
+        )
