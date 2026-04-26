@@ -48,7 +48,7 @@
       <sensor type="gpu_ray" name="robosense-RS16">
         <pose>0 0 0 0 0 0</pose>
         <visualize>false</visualize>
-        <update_rate>1</update_rate>
+        <update_rate>10</update_rate>
         <ray>
           <scan>
             <horizontal>
