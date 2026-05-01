@@ -13,9 +13,10 @@ Covers setup, configuration, environment API, logging, and running RL training i
 5. [BarnEnv — Environment API](#barnenv--environment-api)
 6. [RLLogger — Training Logger](#rllogger--training-logger)
 7. [Running Training](#running-training)
-8. [Running the Tests](#running-the-tests)
-9. [Output Files](#output-files)
-10. [Troubleshooting](#troubleshooting)
+8. [MPPI Controller](#mppi-controller)
+9. [Running the Tests](#running-the-tests)
+10. [Output Files](#output-files)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -399,6 +400,153 @@ model.save("results/rl/ppo_moborobo_world30")
 logger.close()
 env.close()
 ```
+
+---
+
+## MPPI Controller
+
+MPPI (Model Predictive Path Integral) is a sampling-based optimal control method. Instead of learning a policy, it samples K random perturbations around a nominal control sequence every timestep, rolls out the dynamics model to evaluate each trajectory's cost, then takes a soft-weighted average to improve the nominal sequence.
+
+**Why use MPPI here?**
+- Good baseline to compare RL against — no training required
+- Works with the existing `BarnEnv` infrastructure (world loading, collision detection, logging)
+- Tunable via `configs/mppi_config.py` with no code changes
+- Pure numpy — no additional dependencies
+
+### How it works in ROS / Gazebo
+
+MPPI does **not** use move_base. It runs as a Python controller that:
+1. Reads the current robot pose from Gazebo ground truth (`get_pose()`)
+2. Reads the current laser scan (`get_scan_info()`)
+3. Samples K velocity sequences, rolls them out using a unicycle dynamics model
+4. Picks the optimal action and publishes it to `/cmd_vel` via `env.step(action)`
+
+The dynamics model is a simple unicycle:
+```
+x_{t+1} = x_t + v_t · cos(θ_t) · dt
+y_{t+1} = y_t + v_t · sin(θ_t) · dt
+θ_{t+1} = θ_t + ω_t · dt
+```
+
+Cost terms:
+| Term | Config key | Description |
+|---|---|---|
+| Obstacle cost | `W_OBSTACLE` | `exp(−clearance / OBS_SIGMA)` summed over horizon |
+| Terminal goal | `W_GOAL` | Euclidean distance to goal at end of horizon |
+| Per-step goal | `W_GOAL_STEP` | Mean distance to goal across all steps (dense) |
+| Regularisation | `LAMBDA` | MPPI control cost: λ · u^T Σ⁻¹ ε |
+
+### MPPI configuration (`configs/mppi_config.py`)
+
+| Setting | Default | Description |
+|---|---|---|
+| `K` | `500` | Number of sampled trajectories per step |
+| `T` | `20` | Planning horizon (steps); lookahead = T × DT seconds |
+| `DT` | `0.1` s | Should match `RLEnvConfig.STEP_DURATION` |
+| `LAMBDA` | `1.0` | Temperature — lower = greedier, higher = softer |
+| `SIGMA_V` | `0.12` m/s | Linear velocity noise std |
+| `SIGMA_W` | `0.5` rad/s | Angular velocity noise std |
+| `MAX_V` | from robot config | Linear velocity ceiling |
+| `MAX_W` | from robot config | Angular velocity ceiling |
+| `W_OBSTACLE` | `80.0` | Obstacle cost weight |
+| `W_GOAL` | `2.0` | Terminal goal cost weight |
+| `W_GOAL_STEP` | `0.5` | Per-step goal cost weight |
+| `OBS_SIGMA` | `0.4` m | Obstacle cost decay distance |
+| `ROBOT_RADIUS` | `0.4` m | Safety clearance (conservative) |
+| `SCAN_SUBSAMPLE` | `4` | Use every Nth ray (720-ray scan → 180 obstacle pts) |
+
+### Usage with BarnEnv
+
+```python
+from rl import BarnEnv
+from rl.controllers import MPPIController
+from rl.logging import RLLogger
+from configs.rl_config import RLLogConfig
+
+env = BarnEnv(robot="moborobo", world_idx=30, managed=False)
+ctrl = MPPIController(goal_x=env.goal_pos[0], goal_y=env.goal_pos[1])
+logger = RLLogger("mppi_world30", config={"algo": "MPPI", "K": 500, "T": 20})
+
+obs, info = env.reset()
+ctrl.reset()
+
+for step in range(10_000):
+    # Get raw state for MPPI (bypasses the normalised gym observation)
+    ranges, angle_min, angle_inc, max_r = env.get_scan_info()
+    x, y, theta = env.get_pose()
+
+    if ranges is not None:
+        action = ctrl.compute_action(x, y, theta, ranges, angle_min, angle_inc, max_r)
+    else:
+        action = env.action_space.low.copy()   # wait for first scan
+
+    obs, reward, terminated, truncated, info = env.step(action)
+
+    if terminated or truncated:
+        logger.log_episode(
+            episode=info["episode"],
+            world_idx=info["world_idx"],
+            outcome=info["outcome"],
+            steps=info["step"],
+            total_reward=info["episode_reward"],
+            final_dist=info["dist_to_goal"],
+        )
+        obs, info = env.reset()
+        ctrl.reset()
+
+    if step % RLLogConfig.LOG_EVERY_STEPS == 0:
+        logger.log_progress(timestep=step)
+
+logger.close()
+env.close()
+```
+
+### Standalone usage (without BarnEnv)
+
+MPPI can also run as a ROS node independently, without the gym wrapper — useful for quick navigation tests.
+
+```python
+import rospy, time, numpy as np
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+from gazebo.gazebo_simulation import GazeboSimulation
+from rl.controllers import MPPIController
+from rl.env.barn_env import _quat_to_yaw
+from configs.config import WorldConfig
+
+rospy.init_node("mppi_node", anonymous=True)
+sim = GazeboSimulation(init_position=WorldConfig.STATIC_INIT_POSITION)
+gx = WorldConfig.STATIC_INIT_POSITION[0] + WorldConfig.STATIC_GOAL_OFFSET[0]
+gy = WorldConfig.STATIC_INIT_POSITION[1] + WorldConfig.STATIC_GOAL_OFFSET[1]
+ctrl = MPPIController(goal_x=gx, goal_y=gy)
+pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+
+rate = rospy.Rate(10)   # 10 Hz, matches DT=0.1
+while not rospy.is_shutdown():
+    scan = rospy.wait_for_message("/scan", LaserScan, timeout=5.0)
+    state = sim.get_model_state()
+    pos = state.pose.position
+    ori = state.pose.orientation
+    theta = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
+
+    action = ctrl.compute_action(
+        pos.x, pos.y, theta,
+        scan.ranges, scan.angle_min, scan.angle_increment, scan.range_max,
+    )
+
+    msg = Twist()
+    msg.linear.x, msg.angular.z = float(action[0]), float(action[1])
+    pub.publish(msg)
+    rate.sleep()
+```
+
+### Tuning tips
+
+- **Robot freezes near obstacles** → lower `OBS_SIGMA` (sharper cliff) or raise `K`
+- **Robot ignores obstacles and collides** → raise `W_OBSTACLE`
+- **Robot does not move toward goal** → raise `W_GOAL` or `W_GOAL_STEP`
+- **Trajectories are jerky** → raise `LAMBDA` or lower `SIGMA_V`/`SIGMA_W`
+- **Too slow** → lower `K` (300 is usually fine) or raise `SCAN_SUBSAMPLE`
 
 ---
 

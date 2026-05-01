@@ -204,6 +204,8 @@ class BarnEnv(gym.Env):
         self._cmd_vel_pub: Optional[rospy.Publisher] = None
 
         self._latest_scan: Optional[np.ndarray] = None
+        self._scan_angle_min: float = -math.pi
+        self._scan_angle_increment: float = 0.0087   # default from barn_move_base.launch
         self._scan_lock = threading.Lock()
 
         self._ros_ready = False
@@ -457,6 +459,8 @@ class BarnEnv(gym.Env):
         ranges = np.clip(ranges, msg.range_min, msg.range_max)
         with self._scan_lock:
             self._latest_scan = ranges
+            self._scan_angle_min = float(msg.angle_min)
+            self._scan_angle_increment = float(msg.angle_increment)
 
     def _wait_for_scan(self):
         deadline = time.time() + _SCAN_WAIT_TIMEOUT
@@ -510,6 +514,48 @@ class BarnEnv(gym.Env):
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public helpers for MPPI / classical controllers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @property
+    def goal_pos(self) -> Tuple[float, float]:
+        """World-frame goal position (x, y)."""
+        return self._goal_pos
+
+    def get_scan_info(self) -> Tuple[Optional[np.ndarray], float, float, float]:
+        """
+        Return raw scan data needed by MPPI.
+
+        Returns
+        -------
+        ranges : np.ndarray | None
+            Range values in metres (None if no scan received yet).
+        angle_min : float
+            Start angle of the scan (radians).
+        angle_increment : float
+            Angular step between consecutive rays (radians).
+        max_range : float
+            Maximum valid range of the sensor (metres).
+        """
+        with self._scan_lock:
+            ranges = self._latest_scan.copy() if self._latest_scan is not None else None
+        return ranges, self._scan_angle_min, self._scan_angle_increment, self._scan_max_range
+
+    def get_pose(self) -> Tuple[float, float, float]:
+        """
+        Return the current robot pose from Gazebo ground truth.
+
+        Returns
+        -------
+        x, y : float   — world-frame position (metres)
+        theta : float  — yaw angle (radians)
+        """
+        state = self._gazebo_sim.get_model_state()
+        pos = state.pose.position
+        ori = state.pose.orientation
+        return pos.x, pos.y, _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
+
     # ──────────────────────────────────────────────────────────────────────────
 
     def _pub_cmd(self, linear: float, angular: float):
