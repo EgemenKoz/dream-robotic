@@ -127,8 +127,15 @@ if __name__ == "__main__":
         if jackal_devel not in cmake_path:
             os.environ["CMAKE_PREFIX_PATH"] = jackal_devel + (":" + cmake_path if cmake_path else "")
 
-    print(">>>>>>>>>>>>>>>>>> Loading world_%d from BARN_dataset [robot=%s] <<<<<<<<<<<<<<<<<<" % (
-        args.world_idx, args.robot))
+    # Make the moborobo package findable by roslaunch/rospkg.
+    if args.robot == "moborobo" and os.path.isdir(Paths.ROBOTS_DIR):
+        pkg_path = os.environ.get("ROS_PACKAGE_PATH", "")
+        if Paths.ROBOTS_DIR not in pkg_path:
+            os.environ["ROS_PACKAGE_PATH"] = Paths.ROBOTS_DIR + (":" + pkg_path if pkg_path else "")
+
+    dataset_label = "moborobo_dataset" if args.robot == "moborobo" else "BARN_dataset"
+    print(">>>>>>>>>>>>>>>>>> Loading world_%d from %s [robot=%s] <<<<<<<<<<<<<<<<<<" % (
+        args.world_idx, dataset_label, args.robot))
 
     rospack = rospkg.RosPack()
 
@@ -199,8 +206,8 @@ if __name__ == "__main__":
     nav_as = actionlib.SimpleActionClient("/move_base", MoveBaseAction)
     mb_goal = MoveBaseGoal()
     mb_goal.target_pose.header.frame_id = "odom"
-    mb_goal.target_pose.pose.position.x = GOAL_POSITION[0]
-    mb_goal.target_pose.pose.position.y = GOAL_POSITION[1]
+    mb_goal.target_pose.pose.position.x = goal_coor[0]
+    mb_goal.target_pose.pose.position.y = goal_coor[1]
     mb_goal.target_pose.pose.position.z = 0
     mb_goal.target_pose.pose.orientation = Quaternion(0, 0, 0, 1)
 

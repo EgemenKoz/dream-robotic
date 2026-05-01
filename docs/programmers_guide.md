@@ -445,6 +445,13 @@ rosbag play <bagfile>.bag
 |---|---|
 | `run_barn_custom.py` | Main entry point — run simulations |
 | `configs/config.py` | All simulation, robot, and nav settings |
+| `configs/rl_config.py` | RL environment, logging, and eval defaults |
+| `configs/mppi_config.py` | MPPI controller hyperparameters |
+| `rl/env/barn_env.py` | Gymnasium environment wrapping Gazebo |
+| `rl/controllers/mppi.py` | MPPI optimal controller (pure numpy) |
+| `rl/logging/rl_logger.py` | Per-run CSV + human-readable training logger |
+| `rl/tests/test_barn_env.py` | Unit and Gazebo integration tests |
+| `docs/rl_guide.md` | Full RL package documentation |
 | `docs/barn_lab_documentation.md` | Full barn_lab reference documentation |
 | `docs/programmers_guide.md` | This guide |
 

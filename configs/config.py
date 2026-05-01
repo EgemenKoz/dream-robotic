@@ -23,6 +23,15 @@ class Paths:
     METRICS_FILES      = join(BARN_DATASET, "metrics_files")
     NORM_METRICS_FILES = join(BARN_DATASET, "norm_metrics_files")
 
+    MOBOROBO_DATASET     = expanduser("~/Desktop/moborobo_dataset")
+    MOBOROBO_WORLD_FILES      = join(MOBOROBO_DATASET, "world_files")
+    MOBOROBO_PATH_FILES       = join(MOBOROBO_DATASET, "path_files")
+    MOBOROBO_MAP_FILES        = join(MOBOROBO_DATASET, "map_files")
+    MOBOROBO_GRID_FILES       = join(MOBOROBO_DATASET, "grid_files")
+    MOBOROBO_CSPACE_FILES     = join(MOBOROBO_DATASET, "cspace_files")
+    MOBOROBO_METRICS_FILES    = join(MOBOROBO_DATASET, "metrics_files")
+    MOBOROBO_NORM_METRICS_FILES = join(MOBOROBO_DATASET, "norm_metrics_files")
+
     JACKAL_WS        = "/home/egemen/barn_lab/jackal_ws"
     BARN_CHALLENGE   = join(JACKAL_WS, "src/the-barn-challenge")
     JACKAL_HELPER    = join(BARN_CHALLENGE, "jackal_helper")
@@ -134,32 +143,43 @@ class WorldConfig:
     GRID_SIZE            = 30      # 30x30 grid cells
 
     @staticmethod
+    def _is_moborobo():
+        return SimConfig.ROBOT == "moborobo"
+
+    @staticmethod
     def world_file(world_idx: int) -> str:
-        return join(Paths.WORLD_FILES, "world_%d.world" % world_idx)
+        base = Paths.MOBOROBO_WORLD_FILES if WorldConfig._is_moborobo() else Paths.WORLD_FILES
+        return join(base, "world_%d.world" % world_idx)
 
     @staticmethod
     def path_file(world_idx: int) -> str:
-        return join(Paths.PATH_FILES, "path_%d.npy" % world_idx)
+        base = Paths.MOBOROBO_PATH_FILES if WorldConfig._is_moborobo() else Paths.PATH_FILES
+        return join(base, "path_%d.npy" % world_idx)
 
     @staticmethod
     def map_yaml(world_idx: int) -> str:
-        return join(Paths.MAP_FILES, "yaml_%d.yaml" % world_idx)
+        base = Paths.MOBOROBO_MAP_FILES if WorldConfig._is_moborobo() else Paths.MAP_FILES
+        return join(base, "yaml_%d.yaml" % world_idx)
 
     @staticmethod
     def grid_file(world_idx: int) -> str:
-        return join(Paths.GRID_FILES, "grid_%d.npy" % world_idx)
+        base = Paths.MOBOROBO_GRID_FILES if WorldConfig._is_moborobo() else Paths.GRID_FILES
+        return join(base, "grid_%d.npy" % world_idx)
 
     @staticmethod
     def cspace_file(world_idx: int) -> str:
-        return join(Paths.CSPACE_FILES, "cspace_%d.npy" % world_idx)
+        base = Paths.MOBOROBO_CSPACE_FILES if WorldConfig._is_moborobo() else Paths.CSPACE_FILES
+        return join(base, "cspace_%d.npy" % world_idx)
 
     @staticmethod
     def metrics_file(world_idx: int) -> str:
-        return join(Paths.METRICS_FILES, "metrics_%d.npy" % world_idx)
+        base = Paths.MOBOROBO_METRICS_FILES if WorldConfig._is_moborobo() else Paths.METRICS_FILES
+        return join(base, "metrics_%d.npy" % world_idx)
 
     @staticmethod
     def norm_metrics_file(world_idx: int) -> str:
-        return join(Paths.NORM_METRICS_FILES, "norm_metrics_%d.npy" % world_idx)
+        base = Paths.MOBOROBO_NORM_METRICS_FILES if WorldConfig._is_moborobo() else Paths.NORM_METRICS_FILES
+        return join(base, "norm_metrics_%d.npy" % world_idx)
 
 
 # ── Gazebo Simulation ──────────────────────────────────────────────────────────
@@ -189,7 +209,7 @@ class NavConfig:
     # Navigation metric: score = success * optimal_time / clip(actual, lo, hi)
     METRIC_TIME_LO   = 2.0            # multiplier on optimal_time for clip lower bound
     METRIC_TIME_HI   = 8.0            # multiplier on optimal_time for clip upper bound
-    NOMINAL_SPEED    = 0.5            # m/s — used to compute optimal_time from path length
+    NOMINAL_SPEED    = 2.0            # m/s — Jackal max speed, used by BARN challenge to compute OT
 
     # Costmap
     OBSTACLE_RANGE   = 2.5            # meters
@@ -240,10 +260,7 @@ def apply_env(robot: str = None):
         # After building, the .so lands in the catkin devel/lib directory.
         # GAZEBO_PLUGIN_PATH must include that lib dir so Gazebo can find it.
         # Adjust this path to wherever catkin built the plugin.
-        robosense_plugin_dir = join(
-            Paths.ROBOTS_DIR, "robosense_simulator",
-            "robosense_gazebo_plugins", "lib"
-        )
+        robosense_plugin_dir = expanduser("~/barn_lab/moborobo_ws/devel/lib")
         existing = os.environ.get("GAZEBO_PLUGIN_PATH", "")
         os.environ["GAZEBO_PLUGIN_PATH"] = (
             robosense_plugin_dir + ":" + existing if existing else robosense_plugin_dir
