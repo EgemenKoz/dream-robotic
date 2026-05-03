@@ -34,19 +34,24 @@ class MPPIConfig:
     """
 
     # ── Sampling ──────────────────────────────────────────────────────────────
-    K: int = 500      # number of sampled trajectories per control update
-    T: int = 20       # planning horizon (steps); total lookahead = T × DT seconds
+    K: int = 900     # number of sampled trajectories per control update
+    T: int = 40      # planning horizon (steps); total lookahead = T × DT seconds
+                     # at MAX_V=0.2 m/s: 40×0.1s×0.2 = 0.8 m — enough to see around corners
+    OBSTACLE_STRIDE: int = 3  # check obstacle cost only every Nth timestep in rollout
+                               # reduces (K,T,N,2) array 3× without losing collision signal
 
     # Timestep must match BarnEnv.step_duration / RLEnvConfig.STEP_DURATION
     DT: float = 0.1   # seconds per MPPI rollout step
 
     # Temperature — controls how aggressively the best trajectories are favoured.
     # Lower → greedier (exploit); Higher → softer (more exploration).
-    LAMBDA: float = 1.0
+    LAMBDA: float = 1.0   # sharper — good forward trajectories dominate over zero-velocity ones
 
     # ── Control noise ─────────────────────────────────────────────────────────
     SIGMA_V: float = 0.12   # linear velocity noise std (m/s)
-    SIGMA_W: float = 0.5    # angular velocity noise std (rad/s)
+    SIGMA_W: float = 0.4    # angular velocity noise std (rad/s)
+                            # 0.8 caused most trajectories to curve into walls in narrow corridors
+                            # (lateral deviation ~0.64m >> 0.08m safe band); 0.4 keeps samples viable
 
     # ── Velocity limits (copied from robot config by default) ─────────────────
     # Change ROBOT = "jackal" or "moborobo" to load the correct limits,
@@ -56,15 +61,24 @@ class MPPIConfig:
     MAX_W: float = MoboroboConfig.MAX_ANGULAR_VEL if _robot == "moborobo" else RobotConfig.MAX_ANGULAR_VEL
 
     # ── Cost weights ──────────────────────────────────────────────────────────
-    W_OBSTACLE: float = 80.0    # weight on the obstacle cost term
-    W_GOAL: float = 2.0         # weight on terminal distance-to-goal cost
-    W_GOAL_STEP: float = 0.5    # weight on per-step distance-to-goal (dense)
+    # W_OBSTACLE scales only the soft proximity term inside _obstacle_cost().
+    # Hard collision rejection is handled separately via COLLISION_PENALTY.
+    W_OBSTACLE: float = 3.0     # soft proximity weight
+    W_GOAL: float = 4.0         # terminal distance-to-goal
+    W_GOAL_STEP: float = 1.0    # per-step distance-to-goal (dense reward)
+    W_SPEED: float = 25.0        # penalise mean trajectory speed below MAX_V
+                                 # cost = W_SPEED * (MAX_V - mean_v); range [0, W_SPEED*MAX_V=1.6]
+
+    MIN_V: float = 0.0    # no reverse — backward trajectories beat forward ones near walls
+                          # because they always have lower obstacle cost, pulling weighted
+                          # average negative. robot should rotate to find opening instead.
 
     # ── Obstacle cost ─────────────────────────────────────────────────────────
-    # Obstacle cost = exp(−clearance / OBS_SIGMA) summed over the horizon.
-    # clearance = max(0, dist_to_nearest_obstacle − ROBOT_RADIUS)
-    OBS_SIGMA: float = 0.4    # metres — steepness of cost falloff from obstacles
-    ROBOT_RADIUS: float = 0.4 # metres — conservative safety margin (moborobo is ~0.47 m wide)
+    OBS_SIGMA: float = 0.30       # metres — steepness of soft proximity falloff
+    ROBOT_RADIUS: float = 0.26    # metres — actual moborobo inscribed radius is 0.235m;
+                                  # 0.40 was too conservative and invalidated all corridor trajectories
+    COLLISION_PENALTY: float = 40.0  # further reduced — narrow corridors make all fwd trajectories
+                                     # clip the old radius; penalty must not overwhelm goal cost
 
     # ── Scan subsampling ──────────────────────────────────────────────────────
     # Use every Nth ray when building the obstacle cloud from the LaserScan.
