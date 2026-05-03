@@ -111,8 +111,10 @@ class MPPIController:
     # ──────────────────────────────────────────────────────────────────────────
 
     def reset(self):
-        """Reset nominal control sequence to zero.  Call at every episode start."""
-        self._nom_v[:] = 0.0
+        """Reset nominal control sequence.  Call at every episode start."""
+        # Warm-start at half max speed so sampled trajectories are centred
+        # around forward motion rather than zero — critical for narrow corridors.
+        self._nom_v[:] = self.cfg.MAX_V * 0.5
         self._nom_w[:] = 0.0
 
     def set_goal(self, goal_x: float, goal_y: float):
@@ -163,8 +165,9 @@ class MPPIController:
         eps_v = self._rng.normal(0.0, cfg.SIGMA_V, (K, T))   # (K, T)
         eps_w = self._rng.normal(0.0, cfg.SIGMA_W, (K, T))
 
-        # Perturbed controls — forward velocity is non-negative
-        V = np.clip(self._nom_v[np.newaxis] + eps_v, 0.0, cfg.MAX_V)   # (K, T)
+        # Perturbed controls — allow slight reversal so robot can escape dead-ends
+        min_v = getattr(cfg, "MIN_V", 0.0)
+        V = np.clip(self._nom_v[np.newaxis] + eps_v, min_v, cfg.MAX_V)   # (K, T)
         W = np.clip(self._nom_w[np.newaxis] + eps_w, -cfg.MAX_W, cfg.MAX_W)
 
         # ── Rollout K trajectories ────────────────────────────────────────────
@@ -174,7 +177,7 @@ class MPPIController:
         S = np.zeros(K, dtype=np.float64)
 
         if len(obstacles) > 0:
-            S += self._obstacle_cost(positions, obstacles) * cfg.W_OBSTACLE
+            S += self._obstacle_cost(positions, obstacles)
 
         # Terminal goal cost
         terminal_dist = np.sqrt((final_x - self._goal[0]) ** 2 + (final_y - self._goal[1]) ** 2)
@@ -186,6 +189,11 @@ class MPPIController:
             (positions[:, :, 1] - self._goal[1]) ** 2
         ).mean(axis=1)   # (K,)
         S += step_dist * cfg.W_GOAL_STEP
+
+        # Speed cost: penalise trajectories that are slower than MAX_V
+        w_speed = getattr(cfg, "W_SPEED", 0.0)
+        if w_speed > 0.0:
+            S += w_speed * (cfg.MAX_V - V.mean(axis=1))
 
         # MPPI control regularisation term: λ · u^T Σ^{-1} ε
         reg = (
@@ -276,17 +284,27 @@ class MPPIController:
         np.ndarray, shape (K,) — cost per trajectory.
         """
         cfg = self.cfg
-        # (K, T, N) pairwise distances via broadcasting
+        stride = getattr(cfg, "OBSTACLE_STRIDE", 1)
+        pos = positions[:, ::stride, :]               # (K, T', 2) — subsampled steps
+        # (K, T', N) pairwise distances via broadcasting
         diff = (
-            positions[:, :, np.newaxis, :]          # (K, T, 1, 2)
-            - obstacles[np.newaxis, np.newaxis, :, :]  # (1, 1, N, 2)
+            pos[:, :, np.newaxis, :]                           # (K, T', 1, 2)
+            - obstacles[np.newaxis, np.newaxis, :, :]          # (1,  1,  N, 2)
         )
-        dists = np.sqrt((diff ** 2).sum(axis=-1))    # (K, T, N)
-        min_dists = dists.min(axis=-1)               # (K, T)
+        dists = np.sqrt((diff ** 2).sum(axis=-1))    # (K, T', N)
+        min_dists = dists.min(axis=-1)               # (K, T')
 
+        # Hard term: any step that physically penetrates the robot radius gets a
+        # large fixed penalty. This keeps the soft weight low so MPPI can still
+        # navigate near walls without slowing to a crawl.
+        in_collision = (min_dists < cfg.ROBOT_RADIUS)          # (K, T) bool
+        hard_cost = in_collision.any(axis=1).astype(np.float64) * cfg.COLLISION_PENALTY
+
+        # Soft proximity term: gradient signal for approaching but not hitting.
         clearance = np.maximum(min_dists - cfg.ROBOT_RADIUS, 0.0)
-        cost_per_step = np.exp(-clearance / cfg.OBS_SIGMA)  # (K, T)
-        return cost_per_step.sum(axis=1)             # (K,)
+        soft_cost = np.exp(-clearance / cfg.OBS_SIGMA).sum(axis=1)  # (K,)
+
+        return hard_cost + soft_cost * cfg.W_OBSTACLE
 
     def _scan_to_obstacles(
         self,

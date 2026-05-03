@@ -125,12 +125,23 @@ class MoboroboConfig:
 # ── World / Environment ────────────────────────────────────────────────────────
 
 class WorldConfig:
-    # Static BARN worlds: indices 0–299
-    STATIC_WORLD_COUNT  = 300
-    STATIC_WORLD_RANGE  = range(0, 300)
+    # Static BARN worlds
+    STATIC_WORLD_COUNT          = 300   # jackal dataset: worlds 0–299
+    STATIC_WORLD_RANGE          = range(0, 300)
+    MOBOROBO_WORLD_COUNT        = 153   # moborobo dataset: worlds 0–152
+    MOBOROBO_WORLD_RANGE        = range(0, 153)
 
-    # Standard evaluation set (50 worlds, every 6th index)
-    EVAL_WORLDS = list(range(0, 300, 6))   # [0, 6, 12, ..., 294]
+    # Standard evaluation set (50 worlds)
+    EVAL_WORLDS          = list(range(0, 300, 6))    # jackal:   0, 6, 12, ..., 294
+    MOBOROBO_EVAL_WORLDS = list(range(0, 153, 3))[:50]  # moborobo: 0, 3, 6, ..., 147
+
+    @staticmethod
+    def world_count() -> int:
+        return WorldConfig.MOBOROBO_WORLD_COUNT if WorldConfig._is_moborobo() else WorldConfig.STATIC_WORLD_COUNT
+
+    @staticmethod
+    def eval_worlds() -> list:
+        return WorldConfig.MOBOROBO_EVAL_WORLDS if WorldConfig._is_moborobo() else WorldConfig.EVAL_WORLDS
 
     # Starting pose for static worlds (x, y, yaw in radians)
     STATIC_INIT_POSITION = [-2.25, 3, 1.57]
@@ -180,6 +191,21 @@ class WorldConfig:
     def norm_metrics_file(world_idx: int) -> str:
         base = Paths.MOBOROBO_NORM_METRICS_FILES if WorldConfig._is_moborobo() else Paths.NORM_METRICS_FILES
         return join(base, "norm_metrics_%d.npy" % world_idx)
+
+    @staticmethod
+    def grid_to_gazebo(grid_x: int, grid_y: int):
+        """Convert BARN dataset 30×30 grid coordinates to Gazebo world coordinates."""
+        RADIUS = 0.075
+        r_shift = -RADIUS - (30 * RADIUS * 2)   # -4.575
+        c_shift = RADIUS + 5                      #  5.075
+        return grid_x * (RADIUS * 2) + r_shift, grid_y * (RADIUS * 2) + c_shift
+
+    @staticmethod
+    def gazebo_to_grid_row(gz_x: float) -> int:
+        """Inverse of grid_to_gazebo for the X axis (row index)."""
+        RADIUS = 0.075
+        r_shift = -RADIUS - (30 * RADIUS * 2)
+        return int(round((gz_x - r_shift) / (2 * RADIUS)))
 
 
 # ── Gazebo Simulation ──────────────────────────────────────────────────────────
