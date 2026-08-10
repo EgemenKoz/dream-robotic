@@ -13,8 +13,10 @@ Covers setup, running, config options, and troubleshooting for both the **Jackal
 5. [Config Reference](#config-reference)
 6. [Switching Between Robots](#switching-between-robots)
 7. [Running Multiple Worlds](#running-multiple-worlds)
-8. [Reading Results](#reading-results)
-9. [Troubleshooting](#troubleshooting)
+8. [RL Training (SAC)](#rl-training-sac)
+9. [Benchmarking Planners](#benchmarking-planners)
+10. [Reading Results](#reading-results)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -60,6 +62,7 @@ Do this in every new terminal before running the simulation. Order matters.
 #    (provides rospkg, numpy, defusedxml, netifaces)
 export PATH="$HOME/barn_lab/nav_challenge/bin:$PATH"
 
+source "$HOME/barn_lab/nav_challenge/bin/activate"
 # 2. Source ROS and workspaces
 source /opt/ros/noetic/setup.bash
 source ~/barn_lab/jackal_ws/devel/setup.bash
@@ -233,6 +236,203 @@ for i in $(seq 0 6 294); do
     python3 run_barn_custom.py --world_idx $i --robot moborobo --out moborobo_eval.txt
 done
 ```
+
+---
+
+## RL Training (SAC)
+
+Trains a Soft Actor-Critic policy on the BARN worlds via `train_sac.py`.
+See [`docs/rl_structure.md`](rl_structure.md) for the full observation / reward / architecture description.
+
+### Before you start
+
+1. Sanity-check the obs and reward scaling (no training, ~30 s):
+   ```bash
+   python3 train_sac.py --robot moborobo --debug-obs
+   ```
+2. Verify the Gazebo/ROS pipeline (resets + a few random steps):
+   ```bash
+   python3 train_sac.py --robot moborobo --smoke-test
+   ```
+
+### Start a fresh run
+
+```bash
+# Moborobo, standard 50-world eval set, 200k steps
+python3 train_sac.py --robot moborobo --total-steps 200000
+
+# Smaller/faster: 10 worlds, 100k steps
+python3 train_sac.py --robot moborobo \
+    --worlds 0 30 60 90 120 150 180 210 240 270 \
+    --total-steps 100000
+```
+
+Each run creates `results/rl/runs/{timestamp}/` containing:
+
+| File | Contents |
+|---|---|
+| `episodes.csv` | one row per episode (outcome, steps, reward, final dist) |
+| `model_<N>_steps.zip` | policy checkpoint every `--save-every` steps (default 20k) |
+| `model_<N>_steps_replay_buffer*.pkl` | replay buffer saved alongside each checkpoint |
+| `model_final.zip` | policy saved when the run exits (**no** replay buffer) |
+| `tb/` | TensorBoard logs |
+
+### Curriculum learning (easy → hard)
+
+`--curriculum` trains on progressively harder worlds. Worlds are ranked by a
+combined difficulty score from the 5 BARN metrics (clearance, visibility,
+dispersion, characteristic dimension, tortuosity — see `rl/curriculum.py`) and
+split into even-thirds tiers. `--total-steps` is divided into three equal phases:
+
+| Phase | Steps | World pool |
+|---|---|---|
+| 1 | 0 – ⅓ | easy (51 worlds) |
+| 2 | ⅓ – ⅔ | easy + medium (102) |
+| 3 | ⅔ – end | all (153) |
+
+The pool stays *cumulative* so the policy keeps revisiting mastered worlds and
+doesn't forget them. Tiers are derived from the dataset's `metrics_files/`.
+
+```bash
+python3 train_sac.py --robot moborobo --curriculum --total-steps 200000
+```
+
+Inspect the tier assignment without training:
+```bash
+python3 -c "from rl.curriculum import difficulty_tiers; t=difficulty_tiers('moborobo'); \
+print({k: v for k,v in t.items()})"
+```
+
+`--curriculum` overrides `--worlds`. The phase boundaries print at startup and
+each advance is logged (`[curriculum] step N: advancing to M worlds`).
+
+### Resume a previous run
+
+`--resume` continues training from a checkpoint. `--total-steps` is then **additional** steps (e.g. `--total-steps 100000` after a 40k checkpoint trains up to 160k total).
+
+```bash
+# Resume from the 40k checkpoint (keeps the warm replay buffer — preferred)
+python3 train_sac.py --robot moborobo \
+    --resume results/rl/runs/20260519_171857/model_40000_steps \
+    --total-steps 160000
+
+# Resume from model_final (no replay buffer — SAC refills it over ~5k noisy steps)
+python3 train_sac.py --robot moborobo \
+    --resume results/rl/runs/20260519_171857/model_final \
+    --total-steps 160000
+```
+
+Notes:
+- Pass the path **without** `.zip` — the script appends it.
+- **Prefer a `model_<N>_steps` checkpoint over `model_final`**: only the numbered
+  checkpoints have a saved replay buffer next to them. The script auto-loads the
+  buffer if it finds `model_replay_buffer_<N>_steps.pkl` in the same directory;
+  otherwise it warns and starts with an empty buffer.
+- The resumed run writes to a **new** `results/rl/runs/{timestamp}/` directory.
+  TensorBoard still shows continuous curves if you point `--logdir` at the
+  parent `results/rl/runs`.
+
+### Monitor training
+
+```bash
+# Live episode log
+tail -f results/rl/runs/{RUN_ID}/episodes.csv
+
+# TensorBoard (separate terminal)
+tensorboard --logdir results/rl/runs
+# → http://localhost:6006   (watch rollout/ep_rew_mean, train/entropy_coef, train/critic_loss)
+```
+
+### Key hyperparameters
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--total-steps` | 200000 | Env steps (additional steps when `--resume`) |
+| `--episodes-per-world` | 5 | Episodes before cycling to the next world |
+| `--save-every` | 20000 | Checkpoint interval (steps) |
+| `--lr` | 3e-4 | Learning rate |
+| `--batch-size` | 256 | SAC batch size |
+| `--buffer-size` | 100000 | Replay buffer capacity |
+| `--ent-coef` | auto | SAC entropy coefficient |
+
+### Deploy a trained policy in the benchmark
+
+The trained SAC policy is one of the planners in `benchmark/run_benchmark.py`
+(see [Benchmarking Planners](#benchmarking-planners)):
+
+```bash
+python3 -m benchmark.run_benchmark --planners rl_sac \
+    --rl-model results/rl/runs/{RUN_ID}/model_final
+```
+
+### If a run hangs or crashes
+
+A crashed run can leave orphan ROS/Gazebo processes that block the next run.
+Clean them up before retrying:
+
+```bash
+pkill -SIGKILL -f 'gzserver|gzclient'
+pkill -SIGINT  -f 'roslaunch|move_base|pointcloud_to_laserscan'
+sleep 2
+pkill -SIGKILL -f 'roslaunch|move_base|pointcloud_to_laserscan|rosmaster|roscore'
+```
+
+The env now also reaps these automatically on the next launch, and bails out
+with a clear `RuntimeError` if `gzserver` segfaults during init (instead of
+hanging forever in a Gazebo service call).
+
+---
+
+## Benchmarking Planners
+
+`benchmark/run_benchmark.py` compares one or more planners on a shared set of
+worlds (Gazebo is launched once per world and reused across planners, so all
+planners see identical conditions). Available `--planners`:
+
+| Name | Description |
+|---|---|
+| `mppi` | Model-Predictive Path Integral (+ online A* global planner) |
+| `mppi_jax` | MPPI, JAX backend (needs `pip install 'jax[cpu]'`) |
+| `dwa` | Dynamic Window Approach (+ online A* global planner) |
+| `astar_local` | A* with a local follower |
+| `elastic_band` | **Elastic Band** — an A*-seeded chain of free-space "bubbles" deformed each step by internal contraction + external obstacle-repulsion forces, then tracked with pure pursuit |
+| `rl_sac` | Trained SAC policy (requires `--rl-model`) |
+
+```bash
+# Default: mppi + dwa + astar_local on the 50-world eval set (jackal)
+python3 -m benchmark.run_benchmark
+
+# Elastic Band on its own, moborobo, standard eval worlds
+python3 -m benchmark.run_benchmark --robot moborobo --planners elastic_band
+
+# Elastic Band on specific worlds (e.g. an easy, a medium, and a hard one)
+python3 -m benchmark.run_benchmark --robot moborobo --planners elastic_band \
+    --world-list 0 24 42
+
+# Head-to-head: classical planners + Elastic Band + the trained RL policy
+python3 -m benchmark.run_benchmark --robot moborobo \
+    --planners dwa mppi elastic_band rl_sac \
+    --rl-model results/rl/runs/{RUN_ID}/model_final
+```
+
+Each planner's per-world results are written under `results/benchmark/`. See
+[Reading Results](#reading-results) for the score columns.
+
+### Elastic Band tuning
+
+All knobs live in `configs/elastic_band_config.py`:
+
+| Parameter | Meaning |
+|---|---|
+| `K_INTERNAL` | Contraction-force gain (higher → straighter / tauter band) |
+| `K_EXTERNAL` | Repulsion-force gain (higher → pushes harder off obstacles) |
+| `RHO0` | Clearance (m) under which repulsion activates |
+| `DEFORM_ITERS` | Force-update iterations per control step |
+| `LOOKAHEAD` | Pure-pursuit carrot distance along the band |
+| `REPLAN_STEPS` | Rebuild the band from a fresh A* path every N steps |
+
+If the band cuts corners into walls, raise `K_EXTERNAL` / `RHO0`. If it's
+jittery, lower `K_EXTERNAL` or `STEP_ALPHA`.
 
 ---
 

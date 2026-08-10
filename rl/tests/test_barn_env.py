@@ -37,34 +37,47 @@ def _make_env(**kwargs) -> "BarnEnv":
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestObservationSpace:
-    def test_default_shape_is_scan_plus_two(self):
-        env = _make_env(num_scan_rays=360)
-        assert env.observation_space.shape == (362,)
+    """
+    Dict obs:
+      "scan"  : (SCAN_STACK, N) stacked min-pooled frames, [0, 1]
+      "state" : (5,) [dist_norm, sin(angle), cos(angle), last_lin, last_ang]
+    """
 
-    def test_custom_scan_rays(self):
-        env = _make_env(num_scan_rays=180)
-        assert env.observation_space.shape == (182,)
-
-    def test_scan_portion_bounds_zero_to_one(self):
-        env = _make_env(num_scan_rays=360)
-        assert (env.observation_space.low[:360] == 0.0).all()
-        assert (env.observation_space.high[:360] == 1.0).all()
-
-    def test_dist_feature_bounds(self):
+    def test_is_dict_space(self):
+        import gymnasium as gym
         env = _make_env()
-        n = env.num_scan_rays
-        assert env.observation_space.low[n] == 0.0
-        assert env.observation_space.high[n] == 1.0
+        assert isinstance(env.observation_space, gym.spaces.Dict)
+        assert set(env.observation_space.spaces.keys()) == {"scan", "state"}
 
-    def test_angle_feature_bounds(self):
+    def test_default_scan_shape(self):
+        from configs.rl_config import RLEnvConfig
         env = _make_env()
-        n = env.num_scan_rays
-        assert env.observation_space.low[n + 1] == -1.0
-        assert env.observation_space.high[n + 1] == 1.0
+        assert env.observation_space["scan"].shape == (
+            RLEnvConfig.SCAN_STACK, RLEnvConfig.NUM_SCAN_RAYS
+        )
+
+    def test_custom_scan_rays_and_stack(self):
+        env = _make_env(num_scan_rays=180, scan_stack=4)
+        assert env.observation_space["scan"].shape == (4, 180)
+
+    def test_scan_bounds_zero_to_one(self):
+        env = _make_env(num_scan_rays=360)
+        scan_space = env.observation_space["scan"]
+        assert (scan_space.low == 0.0).all()
+        assert (scan_space.high == 1.0).all()
+
+    def test_state_bounds(self):
+        env = _make_env()
+        state_space = env.observation_space["state"]
+        assert state_space.shape == (5,)
+        # [dist, sin, cos, last_lin, last_ang]
+        assert np.allclose(state_space.low,  [0.0, -1.0, -1.0, 0.0, -1.0])
+        assert np.allclose(state_space.high, [1.0,  1.0,  1.0, 1.0,  1.0])
 
     def test_dtype_is_float32(self):
         env = _make_env()
-        assert env.observation_space.dtype == np.float32
+        assert env.observation_space["scan"].dtype == np.float32
+        assert env.observation_space["state"].dtype == np.float32
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -209,10 +222,17 @@ class TestScanNormalisation:
         assert scan.max() <= 1.0 + 1e-6
         assert scan.min() >= 0.0
 
-    def test_max_range_normalises_to_one(self):
+    def test_clip_range_normalises_to_one(self):
         env = _make_env(num_scan_rays=360)
         with env._scan_lock:
-            env._latest_scan = np.full(360, env._scan_max_range, dtype=np.float32)
+            env._latest_scan = np.full(360, env._scan_norm_range, dtype=np.float32)
+        scan = env._get_scan_normalised()
+        assert np.allclose(scan, 1.0)
+
+    def test_beyond_clip_range_saturates_at_one(self):
+        env = _make_env(num_scan_rays=360, scan_clip_range=5.0)
+        with env._scan_lock:
+            env._latest_scan = np.full(360, 8.0, dtype=np.float32)
         scan = env._get_scan_normalised()
         assert np.allclose(scan, 1.0)
 
@@ -241,6 +261,50 @@ class TestScanNormalisation:
         env = _make_env(num_scan_rays=360)
         scan = env._get_scan_normalised()
         assert scan.dtype == np.float32
+
+    def test_thin_obstacle_survives_downsampling(self):
+        # A single close-range ray inside a sector must survive the pooling —
+        # this is the whole point of min-pool over linear interpolation.
+        env = _make_env(num_scan_rays=90)
+        raw = np.full(720, env._scan_norm_range, dtype=np.float32)
+        raw[400] = 0.3   # thin pole at one raw ray
+        with env._scan_lock:
+            env._latest_scan = raw
+        scan = env._get_scan_normalised()
+        assert scan.min() == pytest.approx(0.3 / env._scan_norm_range, abs=1e-5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Min-pool helper
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestMinPool:
+    def test_exact_size_is_identity(self):
+        from rl.env.barn_env import _min_pool
+        x = np.arange(90, dtype=np.float32)
+        assert np.array_equal(_min_pool(x, 90), x)
+
+    def test_takes_sector_minimum(self):
+        from rl.env.barn_env import _min_pool
+        x = np.array([5, 1, 5, 5, 5, 2, 5, 5], dtype=np.float32)
+        out = _min_pool(x, 2)   # sectors [0:4], [4:8]
+        assert np.allclose(out, [1.0, 2.0])
+
+    def test_non_divisible_sizes(self):
+        from rl.env.barn_env import _min_pool
+        x = np.random.default_rng(0).uniform(0, 10, size=722).astype(np.float32)
+        out = _min_pool(x, 90)
+        assert out.shape == (90,)
+        assert out.min() >= x.min() - 1e-6
+        # global minimum must survive pooling
+        assert out.min() == pytest.approx(x.min(), abs=1e-6)
+
+    def test_upsample_falls_back_to_interp(self):
+        from rl.env.barn_env import _min_pool
+        x = np.ones(45, dtype=np.float32) * 3.0
+        out = _min_pool(x, 90)
+        assert out.shape == (90,)
+        assert np.allclose(out, 3.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -284,6 +348,41 @@ class TestMathHelpers:
     def test_wrap_angle_three_pi(self):
         from rl.env.barn_env import _wrap_angle
         assert abs(_wrap_angle(3 * math.pi)) == pytest.approx(math.pi, abs=1e-5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Feature extractor
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestScanStateExtractor:
+    def _space(self, k=3, n=90):
+        import gymnasium as gym
+        return gym.spaces.Dict({
+            "scan": gym.spaces.Box(0.0, 1.0, shape=(k, n), dtype=np.float32),
+            "state": gym.spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32),
+        })
+
+    def test_forward_output_dim(self):
+        import torch as th
+        from rl.models.feature_extractor import ScanStateExtractor
+        space = self._space()
+        ext = ScanStateExtractor(space, scan_features=128, state_features=32)
+        obs = {
+            "scan": th.rand(4, 3, 90),
+            "state": th.rand(4, 5),
+        }
+        out = ext(obs)
+        assert out.shape == (4, 160)
+        assert ext.features_dim == 160
+
+    def test_adapts_to_custom_shapes(self):
+        import torch as th
+        from rl.models.feature_extractor import ScanStateExtractor
+        space = self._space(k=4, n=180)
+        ext = ScanStateExtractor(space)
+        obs = {"scan": th.rand(2, 4, 180), "state": th.rand(2, 5)}
+        out = ext(obs)
+        assert out.shape[0] == 2 and out.shape[1] == ext.features_dim
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -400,19 +499,22 @@ class TestBarnEnvGazebo:
 
     def test_reset_returns_valid_obs(self, env):
         obs, info = env.reset()
-        assert obs.shape == env.observation_space.shape
         assert env.observation_space.contains(obs), "obs out of bounds: %s" % obs
+        assert obs["scan"].shape == env.observation_space["scan"].shape
+        # freshly reset → all stacked frames identical (seeded with 1st frame)
+        assert np.array_equal(obs["scan"][0], obs["scan"][-1])
         assert info["world_idx"] == 30
 
     def test_obs_dtype_is_float32(self, env):
         obs, _ = env.reset()
-        assert obs.dtype == np.float32
+        assert obs["scan"].dtype == np.float32
+        assert obs["state"].dtype == np.float32
 
     def test_step_returns_correct_types(self, env):
         env.reset()
         action = np.array([0.1, 0.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
-        assert obs.shape == env.observation_space.shape
+        assert env.observation_space.contains(obs)
         assert isinstance(reward, float)
         assert isinstance(terminated, bool)
         assert isinstance(truncated, bool)
@@ -424,7 +526,7 @@ class TestBarnEnvGazebo:
         obs, reward, terminated, truncated, info = env.step(
             np.zeros(2, dtype=np.float32)
         )
-        assert obs.shape == env.observation_space.shape
+        assert env.observation_space.contains(obs)
 
     def test_episode_truncates_at_max_steps(self, env):
         from rl.env.barn_env import BarnEnv
@@ -449,16 +551,16 @@ class TestBarnEnvGazebo:
     def test_obs_scan_in_zero_one_after_step(self, env):
         env.reset()
         obs, _, _, _, _ = env.step(np.array([0.1, 0.0], dtype=np.float32))
-        scan = obs[:env.num_scan_rays]
+        scan = obs["scan"]
         assert scan.min() >= 0.0 - 1e-5
         assert scan.max() <= 1.0 + 1e-5
 
     def test_dist_feature_decreases_when_moving_forward(self, env):
         obs0, _ = env.reset()
-        dist0 = obs0[env.num_scan_rays]
+        dist0 = obs0["state"][0]
         # Drive straight toward goal (goal is in +y direction, robot starts facing ~pi/2)
         obs1, _, _, _, _ = env.step(np.array([env._max_linear, 0.0], dtype=np.float32))
-        dist1 = obs1[env.num_scan_rays]
+        dist1 = obs1["state"][0]
         # Allow small tolerance — first step may not move much
         assert dist1 <= dist0 + 0.05, (
             "dist to goal did not decrease after driving forward: %.4f → %.4f" % (dist0, dist1)

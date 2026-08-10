@@ -31,6 +31,7 @@ import os
 import signal
 import sys
 import traceback
+from typing import Optional
 
 import numpy as np
 
@@ -52,14 +53,30 @@ from rl.controllers.mppi import MPPIController
 from rl.controllers.dwa import DWAController
 from rl.controllers.astar_local import AStarLocalController
 from rl.controllers.online_planner import OnlineGlobalPlanner
+from rl.controllers.elastic_band import ElasticBandController
+try:
+    from rl.controllers.mppi_jax import MPPIControllerJAX
+except ImportError:
+    MPPIControllerJAX = None
 
 
 # ── Planner factory ────────────────────────────────────────────────────────────
 
-def make_controller(planner_name: str, goal_x: float, goal_y: float, world_idx: int):
+def make_controller(planner_name: str, goal_x: float, goal_y: float,
+                    world_idx: int, rl_model: Optional[str] = None):
     if planner_name == "mppi":
         return OnlineGlobalPlanner(
             MPPIController(goal_x=goal_x, goal_y=goal_y), goal_x, goal_y
+        )
+    if planner_name == "mppi_jax":
+        if MPPIControllerJAX is None:
+            raise ImportError(
+                "mppi_jax requested but JAX is not installed. "
+                "Install with: pip install -U 'jax[cpu]' "
+                "(or jax[cuda12_pip] for GPU)."
+            )
+        return OnlineGlobalPlanner(
+            MPPIControllerJAX(goal_x=goal_x, goal_y=goal_y), goal_x, goal_y
         )
     if planner_name == "dwa":
         return OnlineGlobalPlanner(
@@ -67,6 +84,14 @@ def make_controller(planner_name: str, goal_x: float, goal_y: float, world_idx: 
         )
     if planner_name == "astar_local":
         return AStarLocalController(goal_x=goal_x, goal_y=goal_y)
+    if planner_name == "elastic_band":
+        # Self-contained: builds + deforms its own band and tracks it.
+        return ElasticBandController(goal_x=goal_x, goal_y=goal_y)
+    if planner_name == "rl_sac":
+        from rl.controllers.rl_sac_controller import SACController
+        return SACController(
+            goal_x=goal_x, goal_y=goal_y, model_path=rl_model,
+        )
     raise ValueError("Unknown planner: %s" % planner_name)
 
 
@@ -104,8 +129,8 @@ def main():
     parser.add_argument(
         "--planners", nargs="+",
         default=["mppi", "dwa", "astar_local"],
-        choices=["mppi", "dwa", "astar_local"],
-        help="Planners to benchmark (default: all three)",
+        choices=["mppi", "mppi_jax", "dwa", "astar_local", "elastic_band", "rl_sac"],
+        help="Planners to benchmark (default: mppi dwa astar_local)",
     )
     parser.add_argument(
         "--worlds", default="eval", choices=["eval", "random"],
@@ -131,6 +156,11 @@ def main():
     parser.add_argument(
         "--out", default=None,
         help="Output directory (default: results/benchmark/benchmark_TIMESTAMP/)",
+    )
+    parser.add_argument(
+        "--rl-model", default=None, metavar="PATH",
+        help="Path to a SAC checkpoint (.zip or run dir) — required when 'rl_sac' "
+             "is in --planners. Also honoured via the RL_SAC_MODEL env var.",
     )
     args = parser.parse_args()
 
@@ -209,7 +239,10 @@ def main():
                 print("  Planner %d/%d: %s" % (p_num, n_planners, planner_name))
 
                 try:
-                    controller = make_controller(planner_name, goal_x, goal_y, world_idx)
+                    controller = make_controller(
+                        planner_name, goal_x, goal_y, world_idx,
+                        rl_model=args.rl_model,
+                    )
                     result = env.run_episode(
                         controller, planner_name, world_idx, timeout=args.timeout
                     )
