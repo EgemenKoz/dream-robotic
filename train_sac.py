@@ -192,7 +192,7 @@ class CurriculumCallback(BaseCallback):
 def _run_debug_obs(env):
     """Sanity-check obs scaling and per-component reward magnitudes.
 
-    Drives a fixed action script and prints obs slices + reward breakdown.
+    Drives a fixed action script (incl. one reverse step) and prints obs slices + reward breakdown.
     Expectations (assuming a fresh BARN reset):
       * scan slice values in [0, 1]
       * dist_norm starts ≈ 1.0 and decreases when driving forward
@@ -207,17 +207,26 @@ def _run_debug_obs(env):
     max_lin = float(env.action_space.high[0])
     max_ang = float(env.action_space.high[1])
 
+    # With scan memory on, the last row of obs["scan"] is the "directly
+    # measured" mask, not a range frame — the newest ranges sit one row up.
+    from configs.rl_config import RLEnvConfig as _C
+    _newest = -2 if _C.SCAN_MEMORY else -1
+
     def _print_obs(tag, obs):
-        scan = obs["scan"][-1]   # newest frame
+        scan = obs["scan"][_newest]
         state = obs["state"]
+        extra = ""
+        if _C.SCAN_MEMORY:
+            fresh = obs["scan"][-1]
+            extra = "  measured=%.0f%%" % (100.0 * float(np.mean(fresh)))
         print(
             "  %-12s scan[min/mean/max]=%.3f/%.3f/%.3f  dist=%.3f  "
-            "sin=%+.3f cos=%+.3f  last_lin=%.3f last_ang=%+.3f"
+            "sin=%+.3f cos=%+.3f  last_lin=%.3f last_ang=%+.3f%s"
             % (
                 tag,
                 float(np.min(scan)), float(np.mean(scan)), float(np.max(scan)),
                 float(state[0]), float(state[1]), float(state[2]),
-                float(state[3]), float(state[4]),
+                float(state[3]), float(state[4]), extra,
             )
         )
 
@@ -232,6 +241,7 @@ def _run_debug_obs(env):
         ("forward", np.array([max_lin, 0.0], dtype=np.float32)),
         ("left",    np.array([0.5 * max_lin, +max_ang], dtype=np.float32)),
         ("right",   np.array([0.5 * max_lin, -max_ang], dtype=np.float32)),
+        ("reverse", np.array([env.action_space.low[0], 0.0], dtype=np.float32)),
         ("stop",    np.array([0.0, 0.0], dtype=np.float32)),
     ]
 
@@ -241,13 +251,16 @@ def _run_debug_obs(env):
         comps = info.get("reward_components", {})
         _print_obs(tag, obs)
         print(
-            "    -> action=(%.2f, %+.2f)  reward=%+.4f  "
-            "[step=%+.3f progress=%+.3f prox=%+.3f heading=%+.3f path=%+.3f  path_dev=%.2fm]"
+            "    -> action=(%.2f, %+.2f)  reward=%+.4f  clr=%.2fm  "
+            "[step=%+.3f progress=%+.3f prox=%+.3f heading=%+.3f path=%+.3f "
+            "path_dev=%.2fm rev=%+.3f phi=%+.2f]"
             % (
                 float(action[0]), float(action[1]), r,
+                info.get("min_range_m", float("nan")),
                 comps.get("step", 0.0), comps.get("progress", 0.0),
                 comps.get("prox", 0.0), comps.get("heading", 0.0),
                 comps.get("path", 0.0), comps.get("path_dev_m", 0.0),
+                comps.get("reverse", 0.0), comps.get("terminal_phi", 0.0),
             )
         )
         if term or trunc:
@@ -261,6 +274,9 @@ def _run_debug_obs(env):
     print("  - cos≈+1, sin≈0 at reset (robot facing goal)?")
     print("  - last_action matches previous step's command after normalisation?")
     print("  - reward components in the expected magnitude range?")
+    print("  - clr is a plausible distance in metres (NOT pinned at 0.45)?")
+    print("  - measured%% < 100 near obstacles means the memory is filling the")
+    print("    blind ring — that is the fix working, not a fault.")
     print("=" * 76, flush=True)
 
 
@@ -295,6 +311,11 @@ def main():
         help="Print progress line every N steps (default: 2000)",
     )
     parser.add_argument(
+        "--gui", action="store_true",
+        help="Open the Gazebo GUI (gzclient) so training can be watched. "
+             "Rendering costs CPU/GPU, so headless (default) trains faster.",
+    )
+    parser.add_argument(
         "--resume", default=None, metavar="PATH",
         help="Resume training from a checkpoint (path without .zip)",
     )
@@ -314,7 +335,15 @@ def main():
     parser.add_argument("--batch-size",   type=int,   default=256)
     parser.add_argument("--buffer-size",  type=int,   default=100_000)
     parser.add_argument("--learning-starts", type=int, default=1_000)
-    parser.add_argument("--gamma",        type=float, default=0.99)
+    parser.add_argument(
+        "--gamma", type=float, default=0.999,
+        help="Discount factor (default: 0.999). At 10 Hz control, 0.99 gives an "
+             "effective horizon of 1/(1-g) = 100 steps = 10 s = 2 m at moborobo's "
+             "0.2 m/s — the goal, ~500 steps out, is discounted to +0.7 and is "
+             "invisible. The policy then optimises dense shaping alone and stops "
+             "dead whenever the next few steps look risky. 0.999 gives a "
+             "1000-step horizon, matching the episode budget.",
+    )
     parser.add_argument("--tau",          type=float, default=0.005)
     parser.add_argument("--ent-coef",     type=str,   default="auto",
                         help="Entropy coefficient — 'auto' or a float (default: auto)")
@@ -367,7 +396,7 @@ def main():
         episodes_per_world=args.episodes_per_world,
         robot=args.robot,
         managed=True,
-        gui=False,
+        gui=args.gui,
         log_dir=run_dir,
     )
 

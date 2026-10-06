@@ -23,6 +23,7 @@ class RLEnvConfig:
     # collision-avoidance literature — Fan & Long et al. ICRA'18/IJRR'20):
     #   "scan"  : (SCAN_STACK, NUM_SCAN_RAYS)  stacked min-pooled LiDAR frames
     #   "state" : (5,)  [dist_norm, sin(angle), cos(angle), last_lin, last_ang]
+    #             last_lin is in [-1, 1] (negative = reversing).
     #
     # Number of laser scan sectors in each frame.  The raw scan (moborobo:
     # ~722 rays, jackal: ~1080) is MIN-POOLED into this many sectors — min,
@@ -42,6 +43,36 @@ class RLEnvConfig:
     # obstacles actually matter.  Values beyond the robot's own max range are
     # clipped by min(SCAN_CLIP_RANGE, robot max range) in BarnEnv.
     SCAN_CLIP_RANGE: float = 5.0
+
+    # ── Near-field memory (see rl/env/scan_memory.py) ────────────────────────
+    # The RS-16 reports nothing closer than 0.40 m and pointcloud_to_laserscan
+    # clips to 0.45 m, so an obstacle about to be hit produces inf — which the
+    # old sanitisation turned into "10 m, free".  The robot's own circumscribed
+    # (turning) radius is 0.4528 m, i.e. it was blind across exactly the area
+    # it sweeps, with ~6 cm between last sighting and contact.
+    #
+    # With memory on, returns are kept in a world-frame point store and
+    # re-projected each step, so a sector that goes blind reports the
+    # remembered range.  Adds one channel to obs["scan"] marking which sectors
+    # were directly measured this step vs. recalled.
+    SCAN_MEMORY: bool = True
+
+    # Sensor near-field cutoff, metres.  Must match the *effective* floor of
+    # the scan pipeline: max(LiDAR plugin <min>, pointcloud_to_laserscan
+    # range_min) = max(0.40, 0.45).  Remembered points inside this radius are
+    # never dropped by raycast clearing.
+    SCAN_BLIND_RADIUS: float = 0.45
+
+    # Points beyond this distance from the robot are forgotten (metres).
+    SCAN_MEM_RADIUS: float = 4.0
+
+    # De-duplication grid for the point store (metres).
+    SCAN_MEM_VOXEL: float = 0.05
+
+    # Points not re-confirmed within this many steps are dropped.  Safety valve
+    # against phantoms parked inside the blind ring, which measurement can
+    # never clear.  150 steps @ 10 Hz = 15 s.
+    SCAN_MEM_MAX_AGE: int = 150
 
     # ── Timing ───────────────────────────────────────────────────────────────
     # Seconds of simulated time per step (Gazebo runs at ~1× real-time).
@@ -97,14 +128,45 @@ class RLEnvConfig:
             return RLEnvConfig.REWARD_PROGRESS_SCALE_MOBOROBO
         return RLEnvConfig.REWARD_PROGRESS_SCALE_JACKAL
 
-    # Penalty for being close to obstacles.  Applied as
-    #   -REWARD_PROX_SCALE * max(0, PROX_THRESHOLD - min_scan_norm) / PROX_THRESHOLD
-    # where min_scan_norm is the closest normalised scan range in [0, 1].
-    REWARD_PROX_SCALE: float = 0.05
-    PROX_THRESHOLD: float = 0.20   # of SCAN_CLIP_RANGE → 1 m at the 5 m default.
-    # Note: scans are normalised by SCAN_CLIP_RANGE (5 m), not the raw sensor
-    # max range, so 0.20 ramps in below 1 m — tight enough that the penalty
-    # actually differentiates inside BARN corridors instead of firing always.
+    # ── Obstacle proximity ───────────────────────────────────────────────────
+    # Expressed in METRES (it used to be a fraction of SCAN_CLIP_RANGE, which
+    # made it impossible to reason about against the 0.45 m sensor floor).
+    #
+    #   t      = clip((PROX_RAMP_START_M - d) / (PROX_RAMP_START_M - PROX_FLOOR_M), 0, 1)
+    #   r_prox = -REWARD_PROX_SCALE * t^2 * (0.5 + 0.5 * |lin| / max_linear)
+    #
+    # Three deliberate changes from the flat linear version:
+    #   * quadratic, so the gradient sharpens as the blind ring approaches
+    #     instead of being a constant nudge;
+    #   * velocity-weighted, because what kills is *speed* across the last
+    #     6 cm, not position alone;
+    #   * scaled 3x, because at 0.05 the penalty peaked at -0.0275/step against
+    #     a +0.25/step progress reward — a 9:1 ratio the policy correctly
+    #     ignored.  At 0.15 the floor value is -0.15, comparable to progress.
+    REWARD_PROX_SCALE: float = 0.15
+    PROX_RAMP_START_M: float = 0.90   # penalty begins here
+    PROX_FLOOR_M: float = 0.50        # penalty saturates here (just above blind ring)
+
+    # Half-angle of the arc used for the proximity penalty (radians), centred
+    # on the direction of travel: straight ahead when driving forward, straight
+    # behind when reversing.  Obstacles the robot is moving away from would
+    # otherwise keep the penalty on forever.  120 deg keeps the sides — where
+    # the 0.4528 m turning sweep matters — and drops only the opposite side.
+    PROX_ARC: float = 2.0944          # 120 degrees
+
+    # ── Reverse driving ──────────────────────────────────────────────────────
+    # The linear action range is [-REVERSE_SPEED_RATIO * max_linear,
+    # max_linear].  Reversing lets the policy back out of a dead end or a
+    # corner it has nosed into instead of having to spin in place inside the
+    # blind ring.  Kept slower than forward because jackal's UST-10 only sees
+    # 270 deg — its rear is covered by the scan memory alone.
+    REVERSE_SPEED_RATIO: float = 1
+
+    # Per-step penalty while reversing:
+    #   r_reverse = -REWARD_REVERSE_SCALE * |lin| / max_linear   (lin < 0 only)
+    # Small on purpose — it only needs to stop the policy from driving the
+    # whole course backwards; backing out of a trap must stay cheap.
+    REWARD_REVERSE_SCALE: float = 0.05
 
     # Penalty for heading misalignment with the goal vector.
     # Applied as -REWARD_HEADING_SCALE * |angle_to_goal| / pi.
@@ -117,14 +179,60 @@ class RLEnvConfig:
     # infer the corridor from LiDAR.
     PATH_FOLLOW_SHAPING: bool = True
     # Per-step penalty: -REWARD_PATH_SCALE * min(d_perp, PATH_MAX_DEV) / PATH_MAX_DEV
-    # Kept well below the max per-step progress reward (+0.25) so path-following
-    # is a nudge toward the A* corridor, not a force that cancels progress.
-    REWARD_PATH_SCALE: float = 0.03
-    PATH_MAX_DEV: float = 1.5   # metres — deviation past this is clipped
+    #
+    # These were 0.03 / 1.5 m, which made the term noise: at the deviation the
+    # policy actually ran (0.34-0.54 m mean, measured over the benchmark) the
+    # penalty was -0.008/step against +0.25/step of progress — 30:1.  The
+    # policy duly ignored the corridor and took a route 10-18% SHORTER than
+    # A* (9.24-9.89 m actual vs 11.05-11.62 m reference), cutting corners until
+    # min clearance sat on the 0.45 m sensor floor in 92-96% of episodes.
+    #
+    # Every one of the 67 trained worlds has >=0.52 m of bottleneck clearance
+    # and the A* reference itself never enters the blind ring (min 0.525 m), so
+    # the safe corridor was there the whole time — the reward simply never
+    # asked for it.
+    #
+    # On the clip: 0.5 m was too tight.  Measured mean deviation is 0.449 m and
+    # the max runs to 1.2 m, so the term spent much of the episode pinned at
+    # its ceiling — and a clipped penalty has ZERO gradient, so it stopped
+    # telling the policy which way to steer and became a flat -0.15/step tax on
+    # existing.  That inflated the cost of every non-success episode and helped
+    # push the policy into freezing.  1.0 m keeps a live gradient across the
+    # whole operating range while still costing -0.067/step at the mean.
+    REWARD_PATH_SCALE: float = 0.15
+    PATH_MAX_DEV: float = 1.0   # metres — deviation past this is clipped
 
     # If True, apply REWARD_PROGRESS_SCALE * (prev_dist - curr_dist) every step.
     # Kept as a kill-switch for ablations / sparse-reward experiments.
     REWARD_SHAPING: bool = True
+
+    # ── Terminal potential ───────────────────────────────────────────────────
+    # Progress shaping is potential-based with Phi(s) = -progress_scale * d(s).
+    # Summed over an episode the per-step term telescopes to
+    # Phi(s_T) - Phi(s_0), so Ng et al. (1999) policy invariance — which needs
+    # Phi(s_T) = 0 — makes total shaping the constant +progress_scale * d_0 for
+    # EVERY trajectory.  That constant is the whole point: it means shaping
+    # cannot rank outcomes, and success > timeout > collision is
+    # decided purely by the terminal rewards above.
+    #
+    # Enforcing Phi(s_T) = 0 means ADDING BACK the potential left in the
+    # terminal state, +progress_scale * dist.  Sign discipline matters here:
+    # subtracting it instead is off by 2 * progress_scale * dist (150 points at
+    # 6 m) and makes failing early vastly worse than failing late.  That
+    # variant was tried and it taught the policy to stop dead mid-course rather
+    # than risk a terminal — timeouts went 2.5% -> 17% and success fell to 29%.
+    # `test_total_shaping_is_independent_of_where_the_episode_ends` locks the
+    # invariant down.
+    #
+    # Applied only to `terminated` (collision / goal), never to
+    # `truncated` — a time limit is a bootstrap cutoff, not a terminal state,
+    # so the critic accounts for the rest through V(s_final).
+    #
+    # NOTE: this only behaves if the discount horizon reaches the goal. With
+    # gamma=0.99 at 10 Hz the horizon is 100 steps (2 m) and the goal is worth
+    # +0.7, so correct shaping plus a myopic gamma still yields a policy that
+    # freezes or charges. The trainers default to gamma=0.999 for this reason.
+    TERMINAL_POTENTIAL_ZERO: bool = True
 
 
 # ── Model / network architecture ──────────────────────────────────────────────

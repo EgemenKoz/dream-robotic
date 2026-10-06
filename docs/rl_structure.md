@@ -29,9 +29,10 @@ configs/rl_config.py             # single source of truth for env / model / log 
    the collision flag. Gazebo is only relaunched when the world index changes.
 4. Each `step()` unpauses Gazebo, publishes `/cmd_vel`, sleeps `STEP_DURATION`
    (default 0.1 s → 10 Hz policy), pauses Gazebo, then reads scan + ground-truth pose.
-5. Episode ends on `get_hard_collision()`, `dist_to_goal ≤ GOAL_TOLERANCE` (1.0 m),
-   or `MAX_EPISODE_STEPS` (500). Outcome (`success` / `collision` / `timeout`)
-   is logged to `results/rl/runs/{run_id}/episodes.csv`.
+5. Episode ends on `get_hard_collision()`,
+   `dist_to_goal ≤ GOAL_TOLERANCE` (1.0 m), or `MAX_EPISODE_STEPS`. Outcome
+   (`success` / `collision` / `timeout`) is logged to
+   `results/rl/runs/{run_id}/episodes.csv`.
 
 ## Observation (two-part `Dict`)
 
@@ -46,7 +47,7 @@ collision avoidance"; Tai et al., IROS'17 mapless navigation; DRL-VO,
 T-RO'23): a *perception* part processed by a 1D-CNN and a low-dimensional
 *state* part processed by a small FC layer, fused before the policy heads.
 
-### `obs["scan"]` — shape `(SCAN_STACK, NUM_SCAN_RAYS)` = `(3, 90)`
+### `obs["scan"]` — shape `(SCAN_STACK + 1, NUM_SCAN_RAYS)` = `(4, 90)`
 
 - Each frame: the raw scan (~722/1080 rays) **min-pooled** into 90 sectors.
   Min — not linear interpolation — so a thin obstacle hit by a single raw
@@ -57,6 +58,40 @@ T-RO'23): a *perception* part processed by a 1D-CNN and a low-dimensional
 - 3 consecutive frames stacked (row 0 = oldest). At 10 Hz this gives the
   CNN 0.3 s of history — enough to infer approach speed toward obstacles.
   On reset the stack is seeded with 3 copies of the first frame.
+- **Row 3 is the "directly measured this step" mask** added by the near-field
+  memory (`RLEnvConfig.SCAN_MEMORY`, see below). `Conv1d` treats rows as
+  channels, so it drops into the existing CNN unchanged.
+
+#### Near-field memory (`rl/env/scan_memory.py`)
+
+The RS-16 reports nothing closer than 0.40 m and `pointcloud_to_laserscan`
+clips to 0.45 m; with `use_inf: true` those rays arrive as `inf`. Sanitising
+them to `range_max` — which is what the code used to do — turned an obstacle
+6 cm from the bumper into a reading of *10 m, maximally free*: the observation
+did not merely miss the danger, it reported the opposite. The geometry makes
+that fatal:
+
+| quantity                    | value      |
+| --------------------------- | ---------- |
+| front bumper from base_link | 0.387 m    |
+| circumscribed (turn) radius | 0.4528 m   |
+| sensor blind radius         | 0.45 m     |
+
+The blind ring is the same size as the footprint's own rotational sweep, and
+there are ~6 cm — three control steps at 0.2 m/s — between last sighting and
+contact.
+
+The zone is only *instantaneously* unobservable, though: an obstacle now at
+0.40 m was measured at 0.50 m a moment ago. `ScanMemory` keeps returns in a
+world-frame point store (voxel-deduplicated, pruned by radius and age) and
+re-projects them into the current robot frame each step, so a blind sector
+reports its remembered range. Points are dropped when a live ray sees straight
+*through* them — except inside the blind ring, where absence of a return is
+not evidence of absence. That single exception is what makes the memory
+survive where it is needed. Cost is ~0.3 ms/step against a 100 ms budget.
+
+Set `RLEnvConfig.SCAN_MEMORY = False` for the old behaviour; the extra channel
+disappears and the shape returns to `(3, 90)`.
 
 ### `obs["state"]` — shape `(5,)`
 
@@ -65,7 +100,7 @@ T-RO'23): a *perception* part processed by a 1D-CNN and a low-dimensional
 | `[0]` | `dist / max_dist`    | `[0, 1]`  | `max_dist` = start→goal straight line       |
 | `[1]` | `sin(angle_to_goal)` | `[-1, 1]` | In robot frame                              |
 | `[2]` | `cos(angle_to_goal)` | `[-1, 1]` | sin/cos avoids the ±π discontinuity         |
-| `[3]` | `last_lin / max_lin` | `[0, 1]`  | Previous step's commanded linear velocity   |
+| `[3]` | `last_lin / max_lin` | `[-1, 1]` | Previous step's commanded linear velocity (<0 = reverse) |
 | `[4]` | `last_ang / max_ang` | `[-1, 1]` | Previous step's commanded angular velocity  |
 
 Why `last_action` in obs: the policy runs at 10 Hz on a robot with inertia.
@@ -92,7 +127,7 @@ obs["state"] (5,)   ─► FC 32 ───────────────�
 
 | Index | Feature       | Range                                   |
 | ----- | ------------- | --------------------------------------- |
-| `[0]` | `linear_x`    | `[0, MAX_LINEAR]` — forward-only        |
+| `[0]` | `linear_x`    | `[-REVERSE_SPEED_RATIO·MAX_LINEAR, MAX_LINEAR]` — reverse allowed (half speed) |
 | `[1]` | `angular_z`   | `[-MAX_ANGULAR, +MAX_ANGULAR]`          |
 
 Per-robot limits (`configs/config.py`):
@@ -102,8 +137,11 @@ Per-robot limits (`configs/config.py`):
 | moborobo  | 0.2 m/s      | 1.0 rad/s     |
 | jackal    | 0.5 m/s      | 1.57 rad/s    |
 
-`linear_x` is clamped at 0 (no reverse) to match the deployed planners and
-avoid pathological "back out of every corner" policies.
+`linear_x` may go negative so the policy can back out of a dead end. Reverse
+is capped at half speed and carries a small per-step cost (`REWARD_REVERSE_SCALE`)
+so it is used to escape traps rather than to drive the course backwards. Set
+`reverse_speed_ratio=0` on `BarnEnv` for the old forward-only behaviour.
+Checkpoints trained forward-only are **not** resumable on the new action space.
 
 ## Reward
 
@@ -111,58 +149,118 @@ Per-step formula (from `BarnEnv.step()`):
 
 ```
 r  = REWARD_STEP                              # -0.01     time penalty
-   + REWARD_PROGRESS_SCALE * (prev_d - d)     # × 5.0     dense shaping toward goal
-   - REWARD_PROX_SCALE * prox_term            # × 0.05    near-obstacle penalty
+   + REWARD_PROGRESS_SCALE * (prev_d - d)     # × 12.5    dense shaping toward goal
+   - REWARD_PROX_SCALE * prox_term            # × 0.15    near-obstacle penalty
    - REWARD_HEADING_SCALE * |angle|/π         # × 0.02    facing-the-goal penalty
-   - REWARD_PATH_SCALE  * path_term           # × 0.10    A* path-deviation penalty
+   - REWARD_PATH_SCALE  * path_term           # × 0.15    A* path-deviation penalty
+   - REWARD_REVERSE_SCALE * |lin|/max_linear  # × 0.05    only while lin < 0
 
-prox_term = max(0, PROX_THRESHOLD - min_scan_norm) / PROX_THRESHOLD
-          # min_scan_norm in [0, 1]; PROX_THRESHOLD = 0.20 (~2 m on a 10-m LiDAR)
+prox_term = t² × (0.5 + 0.5 × |lin|/max_linear)
+          # t = clip((PROX_RAMP_START_M - d_m) / (PROX_RAMP_START_M - PROX_FLOOR_M), 0, 1)
+          # d_m = clearance in METRES over the travel-direction arc (rear arc
+          #       when reversing), fused with the scan memory
+          # ramp 0.90 m → floor 0.50 m; quadratic and speed-weighted
 
 path_term = min(d_perp, PATH_MAX_DEV) / PATH_MAX_DEV
           # d_perp = perpendicular distance from (x, y) to the A* polyline (m)
-          # PATH_MAX_DEV = 1.5 m; deviation past this is clipped
+          # PATH_MAX_DEV = 0.5 m; deviation past this is clipped
 ```
 
-Each component is also exposed in `info["reward_components"]` for debugging.
+Each component is also exposed in `info["reward_components"]` for debugging,
+alongside `info["min_range_m"]` and `info["fresh_frac"]`.
 
 Terminal additions:
 
-| Outcome   | Bonus    | Episode flag |
-| --------- | -------- | ------------ |
-| Goal      | `+100`   | `terminated` |
-| Collision | `-50`    | `terminated` |
-| Timeout   | none     | `truncated`  |
+| Outcome     | Bonus  | Episode flag | Fires when                          |
+| ----------- | ------ | ------------ | ----------------------------------- |
+| Goal        | `+100` | `terminated` | `dist ≤ GOAL_TOLERANCE`             |
+| Collision   | `-50`  | `terminated` | contact reported on `/collision`    |
+| Timeout     | none   | `truncated`  | `MAX_EPISODE_STEPS`                 |
+
+On any `terminated` transition the shaping potential is zeroed
+(`TERMINAL_POTENTIAL_ZERO`): `r += +REWARD_PROGRESS_SCALE * d`, which makes the
+total shaping over *any* episode the constant `+REWARD_PROGRESS_SCALE * d_0`
+(= +125). Truncation is exempt — a time limit is a bootstrap cutoff, not a
+terminal state, so the critic accounts for the remainder through `V(s_final)`.
+
+> **Sign discipline.** The correction *adds* the leftover potential. Subtracting
+> it is off by `2 × scale × d` — 150 points at 6 m — and makes failing early far
+> worse than failing late. That variant shipped once and taught the policy to
+> stop dead mid-course rather than risk a terminal: timeouts went 2.5% → 17%,
+> success fell to 29%, and the robot would drive a few metres and freeze for the
+> rest of the episode. `test_total_shaping_is_independent_of_where_the_episode_ends`
+> guards the invariant.
 
 ### Why each term
 
-- **Progress (`× 5.0`)**: raw `prev_d - d` per step is ≤ 0.05 m (jackal) or
-  ≤ 0.02 m (moborobo). Without scaling the signal is below the step penalty
-  and the agent learns to sit still. ×5 lifts it above the noise floor.
-- **Proximity**: a linear penalty that activates inside 2 m gives a smooth
-  gradient toward "stay clear of walls", instead of relying solely on the
-  terminal -50.
+- **Progress (`× 12.5` moborobo)**: raw `prev_d - d` per step is ≤ 0.05 m
+  (jackal) or ≤ 0.02 m (moborobo). Without scaling the signal is below the
+  step penalty and the agent learns to sit still.
+- **Proximity, in metres and quadratic**: it used to be a flat linear ramp on
+  the *normalised* scan, peaking at -0.0275/step against +0.25/step of
+  progress. The policy correctly ignored a 9:1 ratio and drove until min
+  clearance sat on the 0.45 m sensor floor in 92-96% of episodes. Now the
+  penalty is expressed against the blind ring it is supposed to defend,
+  sharpens as that ring approaches, and scales with speed — because what
+  kills is crossing the last 6 cm quickly, not standing near a wall.
 - **Heading**: small penalty for not facing the goal makes the agent prefer
   forward motion along the goal vector rather than circling.
-- **Collision reduced to -50**: balanced against the progress + proximity
-  shaping so the agent doesn't learn "stop moving = safest".
-- **Path-deviation (`× 0.10`)**: the A* reference path from `path_N.npy` is
-  used as a *reward-only* supervisor. Solves BARN's "which side of this
-  obstacle?" ambiguity, which is invisible from a single-frame LiDAR. The
-  path is never added to the observation — the policy still has to navigate
-  locally using LiDAR; the shaping just pulls it toward the human-curated
-  corridor on average. Disable via `RLEnvConfig.PATH_FOLLOW_SHAPING=False`.
+- **Reverse (`× 0.05`)**: the linear action goes down to
+  `-REVERSE_SPEED_RATIO × max_linear` (half speed) so the policy can back out
+  of a dead end instead of spinning inside the blind ring. A small
+  `-0.05 × |lin| / max_linear` per-step cost keeps it from driving the course
+  backwards. While reversing, the proximity penalty looks at the **rear** arc
+  (`PROX_ARC` centred on π) instead of the front. Jackal's UST-10 only covers
+  270°, so its rear is seen through the scan memory alone.
+- **Zeroing the terminal potential**: progress shaping is potential-based with
+  `Φ(s) = -scale × d`, and Ng et al. (1999) invariance requires
+  `Φ(terminal) = 0`. Without it a crash *kept* the progress it had banked: at
+  the measured mean collision distance of 6.05 m the agent pocketed
+  `12.5 × 3.95 = +49.4` against `-50`, for an episode return of **-15.85**
+  versus a timeout's **-12.62** — crashing cost only 3.2 points more than
+  stopping, and two logged collisions scored *positive*. With the correction
+  the shaping contributes the same `+125` to every episode, so the ordering
+  comes from the terminal rewards alone.
+- **`--gamma 0.999`**: not a cosmetic default. At 10 Hz, `0.99` gives an
+  effective horizon of `1/(1-γ) = 100` steps = 10 s = **2 m** at 0.2 m/s. The
+  goal sits ~500 steps out and is discounted to **+0.7** — invisible. The
+  policy then optimises dense shaping alone, and compares a small per-step
+  cost against an imminent large terminal penalty. Freezing wins that
+  comparison. Measured break-even at `γ=0.99`: the agent must believe it has a
+  **76%** chance of getting through before moving beats standing still. At
+  `γ=0.999` that threshold drops to **~0%**.
+- **Path-deviation (`× 0.15`, clipped at 1.0 m)**: the A* reference path from
+  `path_N.npy` is a *reward-only* supervisor — never added to the observation.
+  At the old `0.03 / 1.5 m` it was noise: -0.008/step at the deviation the
+  policy actually ran, against +0.25/step of progress. The policy duly took a
+  route 10-18% *shorter* than A* by cutting corners. Every one of the 67
+  trained worlds has ≥0.52 m of bottleneck clearance and the A* reference
+  itself never enters the blind ring (min 0.525 m), so the safe corridor was
+  always there — the reward simply never asked for it.
+  The clip must stay above the operating range: at `PATH_MAX_DEV = 0.5 m` the
+  term sat pinned at its ceiling (measured mean deviation 0.449 m, max 1.2 m),
+  and a clipped penalty has **zero gradient** — it stops saying which way to
+  steer and becomes a flat tax on existing.
+  Disable via `RLEnvConfig.PATH_FOLLOW_SHAPING=False`.
 
 ### Reward magnitude budget (per episode, rough caps)
 
-- Progress total: bounded by `REWARD_PROGRESS_SCALE * max_dist` ≈ +50.
+- Progress total: `REWARD_PROGRESS_SCALE × max_dist` = +125 (moborobo).
 - Step penalty: `-0.01 × 500` = -5.
-- Proximity: ≤ `0.05 × 500` = -25 if always near walls.
+- Proximity: ≤ `0.15 × 500` = -75 if pinned at the floor the whole way.
 - Heading: ≤ `0.02 × 500` = -10.
-- Goal bonus: +100.  Collision: -50.
+- Goal +100 · Collision -50 · terminal potential `+12.5 × d`.
 
-So a successful episode earns roughly +100 to +140, a fast collision earns
-~-50, and a timeout that didn't move earns ~-15. The signs are clean.
+Successful episode ≈ **+200**; a crash 4 m in ≈ **-85**; a timeout that made
+partial progress ≈ **+50**. The ordering success ≫ timeout ≫ collision is what
+makes cautious
+progress the optimal policy rather than a coin-flip charge.
+
+Note the tuning constraint: the tightest trained world has a 0.52 m
+bottleneck, where the prox penalty is -0.135 against +0.25 of progress. Net
+per-step reward there stays **positive**, so threading the narrowest gap is
+still profitable — raising `REWARD_PROX_SCALE` past the progress cap would
+make the necessary passages unprofitable and freeze the robot.
 
 ## Training (`train_sac.py`)
 
@@ -267,18 +365,28 @@ training observation exactly:
 | `NUM_SCAN_RAYS`               | 90      | Scan sectors per frame (min-pooled from raw). |
 | `SCAN_STACK`                  | 3       | Consecutive frames stacked in `obs["scan"]`.  |
 | `SCAN_CLIP_RANGE`             | 5.0     | Metres — scan clip + normalisation range.     |
+| `SCAN_MEMORY`                 | `True`  | Fill the blind ring from memory; +1 channel.  |
+| `SCAN_BLIND_RADIUS`           | 0.45    | Metres — effective sensor near-field floor.   |
+| `SCAN_MEM_RADIUS`             | 4.0     | Metres — forget points beyond this.           |
+| `SCAN_MEM_VOXEL`              | 0.05    | Metres — point-store dedup grid.              |
+| `SCAN_MEM_MAX_AGE`            | 150     | Steps before an unconfirmed point is dropped. |
 | `STEP_DURATION`               | 0.1 s   | Sim-time per env step (10 Hz policy).         |
 | `MAX_EPISODE_STEPS`           | 500     | Truncation limit.                             |
 | `REWARD_GOAL`                 | +100    | Terminal bonus on reaching goal.              |
 | `REWARD_COLLISION`            | -50     | Terminal penalty on collision.                |
 | `REWARD_STEP`                 | -0.01   | Per-step time penalty.                        |
-| `REWARD_PROGRESS_SCALE`       | 5.0     | Multiplier on `prev_d - curr_d`.              |
-| `REWARD_PROX_SCALE`           | 0.05    | Near-obstacle penalty scale.                  |
-| `PROX_THRESHOLD`              | 0.20    | Normalised scan distance under which it kicks in. |
+| `REWARD_PROGRESS_SCALE`       | 12.5    | Multiplier on `prev_d - curr_d` (moborobo).   |
+| `REWARD_PROX_SCALE`           | 0.15    | Near-obstacle penalty scale.                  |
+| `PROX_RAMP_START_M`           | 0.90    | Metres — where the prox penalty begins.       |
+| `PROX_FLOOR_M`                | 0.50    | Metres — where it saturates.                  |
+| `PROX_ARC`                    | 2.0944  | Radians — half-angle of the travel-direction arc. |
+| `REVERSE_SPEED_RATIO`         | 0.5     | Reverse speed limit as a fraction of max.     |
+| `REWARD_REVERSE_SCALE`        | 0.05    | Per-step penalty scale while reversing.       |
 | `REWARD_HEADING_SCALE`        | 0.02    | Heading-misalignment penalty scale.           |
 | `PATH_FOLLOW_SHAPING`         | `True`  | Enable A* path-deviation penalty.             |
-| `REWARD_PATH_SCALE`           | 0.10    | Scale of the path-deviation penalty.          |
-| `PATH_MAX_DEV`                | 1.5     | Metres past which the deviation is clipped.   |
+| `REWARD_PATH_SCALE`           | 0.15    | Scale of the path-deviation penalty.          |
+| `PATH_MAX_DEV`                | 1.0     | Metres past which the deviation is clipped.   |
+| `TERMINAL_POTENTIAL_ZERO`     | `True`  | Hand back banked progress on `terminated`.    |
 | `REWARD_SHAPING`              | `True`  | Master kill-switch for all shaping terms.     |
 
 Set `REWARD_SHAPING=False` for a sparse-reward ablation (goal/collision/step only).

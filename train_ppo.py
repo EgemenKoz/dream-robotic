@@ -200,6 +200,11 @@ def main():
         help="Print progress line every N steps (default: 2000)",
     )
     parser.add_argument(
+        "--gui", action="store_true",
+        help="Open the Gazebo GUI (gzclient) so training can be watched. "
+             "Rendering costs CPU/GPU, so headless (default) trains faster.",
+    )
+    parser.add_argument(
         "--resume", default=None, metavar="PATH",
         help="Resume training from a checkpoint (path without .zip)",
     )
@@ -226,7 +231,12 @@ def main():
     parser.add_argument("--n-epochs",   type=int,   default=10,
                         help="Gradient epochs over each rollout (default: 10)")
     parser.add_argument("--lr",         type=float, default=3e-4)
-    parser.add_argument("--gamma",      type=float, default=0.99)
+    parser.add_argument(
+        "--gamma", type=float, default=0.999,
+        help="Discount factor (default: 0.999). At 10 Hz, 0.99 only looks "
+             "100 steps = 2 m ahead, which makes the goal invisible and the "
+             "policy freeze in place; see train_sac.py for the full note.",
+    )
     parser.add_argument("--gae-lambda", type=float, default=0.95,
                         help="GAE λ — trades off bias vs variance in advantage "
                              "estimates (default: 0.95)")
@@ -283,7 +293,7 @@ def main():
         episodes_per_world=args.episodes_per_world,
         robot=args.robot,
         managed=True,
-        gui=False,
+        gui=args.gui,
         log_dir=run_dir,
     )
 

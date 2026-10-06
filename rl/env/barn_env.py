@@ -5,12 +5,21 @@ Direct velocity control (bypasses move_base).
 
 Two-part Dict observation (structure follows the multi-robot DRL
 collision-avoidance literature — Fan & Long et al. ICRA'18 / IJRR'20):
-  obs["scan"]  : (SCAN_STACK, N) — last K LiDAR frames, each min-pooled into
+  obs["scan"]  : (SCAN_STACK [+1], N) — last K frames, each min-pooled into
                  N sectors and normalised by SCAN_CLIP_RANGE → [0, 1].
+                 With RLEnvConfig.SCAN_MEMORY on, ranges are fused with an
+                 egocentric point store so sectors inside the LiDAR's 0.45 m
+                 blind ring report their remembered distance instead of
+                 reading as open space, and one extra row is appended marking
+                 which sectors were directly measured this step.
+                 See rl/env/scan_memory.py for why this is necessary.
   obs["state"] : (5,) — [dist_to_goal_norm (0-1),
                          sin(angle_to_goal), cos(angle_to_goal),
-                         last_linear_norm (0-1), last_angular_norm (-1,1)]
-  act  = [linear_x, angular_z]
+                         last_linear_norm (-1,1), last_angular_norm (-1,1)]
+  act  = [linear_x, angular_z]  — linear_x may be negative (reverse), down to
+         -RLEnvConfig.REVERSE_SPEED_RATIO * max_linear.
+
+Episodes end on contact, on reaching the goal, or on the step limit.
 
 Quick start — Gazebo already running externally:
     env = BarnEnv(robot="moborobo", world_idx=30, managed=False)
@@ -39,8 +48,11 @@ import gymnasium as gym
 from gymnasium import spaces
 
 import rospy
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Path
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from std_msgs.msg import Header
 
 # ── project imports ────────────────────────────────────────────────────────────
 _PROJECT_ROOT = os.path.abspath(join(os.path.dirname(__file__), "../.."))
@@ -55,6 +67,7 @@ from configs.rl_config import RLEnvConfig, RLLogConfig
 
 # GazeboSimulation lives in the local gazebo/ package inside this project.
 from gazebo.gazebo_simulation import GazeboSimulation
+from rl.env.scan_memory import ScanMemory
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -63,6 +76,12 @@ _SCAN_WAIT_TIMEOUT     = 30.0  # seconds to wait for a scan message after reset
                                 # pointcloud_to_laserscan can take 10–20 s the first time)
 _GAZEBO_SVC_TIMEOUT    = 90.0  # seconds to wait for Gazebo services after roslaunch
 _ROSCORE_START_TIMEOUT = 30.0  # seconds to wait for roscore port 11311 to accept
+
+# RViz debug topics (published only while subscribed — see _publish_debug).
+_MEM_CLOUD_TOPIC  = "/rl/scan_memory"
+_FUSED_SCAN_TOPIC = "/rl/fused_scan"
+_REF_PATH_TOPIC   = "/rl/ref_path"
+_DEBUG_Z          = 0.3   # m — draw height of the 2D memory points in base_link
 
 _SCAN_TOPIC = {
     "jackal":   "front/scan",
@@ -129,12 +148,22 @@ class BarnEnv(gym.Env):
     reward_progress_scale : float
         Multiplier on (prev_dist − curr_dist) shaping.
     reward_prox_scale : float
-        Scale of the near-obstacle penalty (see PROX_THRESHOLD).
-    prox_threshold : float
-        Normalised-scan distance under which the obstacle-proximity penalty
-        becomes active (linear ramp toward 0).
+        Scale of the near-obstacle penalty. Quadratic in metres between
+        RLEnvConfig.PROX_RAMP_START_M and PROX_FLOOR_M, weighted by speed.
     reward_heading_scale : float
         Scale of the |angle_to_goal|/π heading penalty.
+    scan_memory : bool
+        Keep an egocentric point store so sectors inside the LiDAR's 0.45 m
+        blind ring report their remembered range instead of "clear".
+        Appends one channel to obs["scan"] (see rl/env/scan_memory.py).
+    reverse_speed_ratio : float
+        Reverse speed limit as a fraction of max_linear; the linear action
+        range is [-ratio * max_linear, max_linear].  0 disables reversing.
+    reward_reverse_scale : float
+        Per-step penalty scale while reversing (-scale * |lin| / max_linear).
+    terminal_potential_zero : bool
+        Subtract the un-cashed progress potential on terminal transitions so
+        that shaping stays policy-invariant (Ng et al. 1999).
     """
 
     metadata = {"render_modes": []}
@@ -160,11 +189,14 @@ class BarnEnv(gym.Env):
         # None → resolved per-robot via RLEnvConfig.reward_progress_scale(robot).
         reward_progress_scale: Optional[float] = None,
         reward_prox_scale: float = RLEnvConfig.REWARD_PROX_SCALE,
-        prox_threshold: float = RLEnvConfig.PROX_THRESHOLD,
         reward_heading_scale: float = RLEnvConfig.REWARD_HEADING_SCALE,
         path_follow_shaping: bool = RLEnvConfig.PATH_FOLLOW_SHAPING,
         reward_path_scale: float = RLEnvConfig.REWARD_PATH_SCALE,
         path_max_dev: float = RLEnvConfig.PATH_MAX_DEV,
+        scan_memory: bool = RLEnvConfig.SCAN_MEMORY,
+        reverse_speed_ratio: float = RLEnvConfig.REVERSE_SPEED_RATIO,
+        reward_reverse_scale: float = RLEnvConfig.REWARD_REVERSE_SCALE,
+        terminal_potential_zero: bool = RLEnvConfig.TERMINAL_POTENTIAL_ZERO,
     ):
         super().__init__()
 
@@ -197,11 +229,13 @@ class BarnEnv(gym.Env):
             else RLEnvConfig.reward_progress_scale(robot)
         )
         self._r_prox_scale = reward_prox_scale
-        self._prox_threshold = prox_threshold
         self._r_heading_scale = reward_heading_scale
         self._path_follow_shaping = path_follow_shaping
         self._r_path_scale = reward_path_scale
         self._path_max_dev = path_max_dev
+        self._scan_memory_on = scan_memory
+        self._r_reverse_scale = reward_reverse_scale
+        self._terminal_potential_zero = terminal_potential_zero
         # Loaded lazily on world change; None disables the path penalty for
         # this episode (e.g. when path_N.npy is missing).
         self._ref_path: Optional[np.ndarray] = None
@@ -210,6 +244,7 @@ class BarnEnv(gym.Env):
         self._model_name = _MODEL_NAME[robot]
         self._max_linear = _MAX_LINEAR[robot]
         self._max_angular = _MAX_ANGULAR[robot]
+        self._max_reverse = float(reverse_speed_ratio) * self._max_linear
         self._scan_max_range = _SCAN_MAX_RANGE[robot]
         # Normalisation range for the scan observation: clip to keep
         # resolution near obstacles (BARN gaps are < 1 m wide).
@@ -230,19 +265,25 @@ class BarnEnv(gym.Env):
         #   "state" : (5,) — [dist_norm       [0, 1],
         #                     sin(angle_to_goal_robot_frame)  [-1, 1],
         #                     cos(angle_to_goal_robot_frame)  [-1, 1],
-        #                     last linear vel / max_linear    [0, 1],
+        #                     last linear vel / max_linear    [-1, 1],
         #                     last angular vel / max_angular  [-1, 1]]
         # sin/cos avoids the discontinuity at ±π that a raw normalised angle has.
+        # When scan memory is on an extra row is appended: a per-sector flag
+        # marking which sectors of the newest frame were directly measured
+        # (1.0) versus recalled from the point store (0.0).  Conv1d treats
+        # rows as channels, so this drops straight into the existing CNN and
+        # lets it tell "far and confirmed" apart from "near but remembered".
         N = num_scan_rays
-        state_low  = np.array([0.0, -1.0, -1.0, 0.0, -1.0], dtype=np.float32)
+        scan_rows = scan_stack + (1 if scan_memory else 0)
+        state_low  = np.array([0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32)
         state_high = np.array([1.0,  1.0,  1.0, 1.0,  1.0], dtype=np.float32)
         self.observation_space = spaces.Dict({
-            "scan":  spaces.Box(0.0, 1.0, shape=(scan_stack, N), dtype=np.float32),
+            "scan":  spaces.Box(0.0, 1.0, shape=(scan_rows, N), dtype=np.float32),
             "state": spaces.Box(state_low, state_high, dtype=np.float32),
         })
 
         self.action_space = spaces.Box(
-            low=np.array([0.0, -self._max_angular], dtype=np.float32),
+            low=np.array([-self._max_reverse, -self._max_angular], dtype=np.float32),
             high=np.array([self._max_linear, self._max_angular], dtype=np.float32),
             dtype=np.float32,
         )
@@ -267,6 +308,22 @@ class BarnEnv(gym.Env):
         # Rolling scan-frame history for obs["scan"]; cleared on reset and
         # re-seeded with K copies of the first frame of the episode.
         self._scan_history: deque = deque(maxlen=scan_stack)
+        # Per-sector fused range in metres for the newest frame, plus the
+        # "directly measured this step" mask.  Kept unnormalised because the
+        # proximity penalty is specified in metres.
+        self._fused_m: np.ndarray = np.full(num_scan_rays, self._scan_max_range,
+                                            dtype=np.float32)
+        self._fresh_mask: np.ndarray = np.zeros(num_scan_rays, dtype=np.float32)
+        self._scan_mem: Optional[ScanMemory] = (
+            ScanMemory(
+                num_sectors=num_scan_rays,
+                blind_radius=RLEnvConfig.SCAN_BLIND_RADIUS,
+                mem_radius=RLEnvConfig.SCAN_MEM_RADIUS,
+                voxel=RLEnvConfig.SCAN_MEM_VOXEL,
+                max_age_steps=RLEnvConfig.SCAN_MEM_MAX_AGE,
+            )
+            if scan_memory else None
+        )
 
         # ── ROS / Gazebo handles ───────────────────────────────────────────────
         self._roscore_proc: Optional[subprocess.Popen] = None
@@ -274,6 +331,11 @@ class BarnEnv(gym.Env):
         self._nav_proc: Optional[subprocess.Popen] = None
         self._gazebo_sim: Optional[GazeboSimulation] = None
         self._cmd_vel_pub: Optional[rospy.Publisher] = None
+        # Debug topics for RViz (see rl/rviz/rl_debug.rviz).  Only filled
+        # while something subscribes, so training pays nothing otherwise.
+        self._mem_cloud_pub: Optional[rospy.Publisher] = None
+        self._fused_scan_pub: Optional[rospy.Publisher] = None
+        self._ref_path_pub: Optional[rospy.Publisher] = None
 
         self._latest_scan: Optional[np.ndarray] = None
         self._scan_angle_min: float = -math.pi
@@ -305,6 +367,8 @@ class BarnEnv(gym.Env):
         self._episode_reward = 0.0
         self._last_action = np.zeros(2, dtype=np.float32)
         self._scan_history.clear()
+        if self._scan_mem is not None:
+            self._scan_mem.reset()
 
         # Choose world
         if self._fixed_world_idx is not None:
@@ -356,9 +420,10 @@ class BarnEnv(gym.Env):
                   flush=True)
         self._wait_for_scan()
 
-        obs = self._build_obs()
         state = self._gazebo_sim.get_model_state()
-        self._prev_dist = _dist(self._goal_pos, (state.pose.position.x, state.pose.position.y))
+        p, o = state.pose.position, state.pose.orientation
+        obs = self._build_obs((p.x, p.y, _quat_to_yaw(o.x, o.y, o.z, o.w)))
+        self._prev_dist = _dist(self._goal_pos, (p.x, p.y))
 
         # NOTE: the key is "episode_idx" (not "episode") to avoid clashing with
         # SB3's Monitor wrapper, which writes info["episode"] = {"r","l","t"} on
@@ -380,13 +445,18 @@ class BarnEnv(gym.Env):
         time.sleep(self.step_duration)
         self._gazebo_sim.pause()
 
-        # Observe
-        obs = self._build_obs()
+        # Observe — one Gazebo service call, shared by the obs and the reward.
         state = self._gazebo_sim.get_model_state()
         pos = state.pose.position
         ori = state.pose.orientation
+        yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
+        obs = self._build_obs((pos.x, pos.y, yaw))
         curr_dist = _dist(self._goal_pos, (pos.x, pos.y))
         collided = self._gazebo_sim.get_hard_collision()
+        # Metres, over the arc around the direction of travel (rear arc when
+        # reversing), fused with the near-field memory — this is the quantity
+        # the proximity penalty is defined against.
+        min_range_m = self._travel_min_m(lin)
 
         # Reward — track each component so it can be surfaced in info / debug.
         r_step = float(self._r_step)
@@ -394,21 +464,28 @@ class BarnEnv(gym.Env):
         r_prox = 0.0
         r_heading = 0.0
         r_path = 0.0
+        r_reverse = 0.0
+        r_terminal_phi = 0.0
         path_dev = 0.0
         if self._r_shaping:
             # progress: positive when moving toward goal
             r_progress = self._r_progress_scale * (self._prev_dist - curr_dist)
 
-            # near-obstacle penalty (linear ramp from threshold to 0)
-            scan_norm = obs["scan"][-1]   # newest frame
-            min_scan = float(np.min(scan_norm)) if scan_norm.size else 1.0
-            if min_scan < self._prox_threshold:
-                r_prox = -self._r_prox_scale * (
-                    (self._prox_threshold - min_scan) / self._prox_threshold
-                )
+            # Near-obstacle penalty, in metres: quadratic ramp from
+            # PROX_RAMP_START_M down to PROX_FLOOR_M and weighted by speed
+            # (either direction).  What kills is crossing the last few centimetres of the
+            # blind ring quickly; holding the same distance while barely
+            # moving is not equally bad, and the old flat linear term could
+            # not express that.
+            ramp = RLEnvConfig.PROX_RAMP_START_M
+            floor = RLEnvConfig.PROX_FLOOR_M
+            if min_range_m < ramp:
+                t = float(np.clip((ramp - min_range_m) / max(ramp - floor, 1e-6),
+                                  0.0, 1.0))
+                speed_w = 0.5 + 0.5 * (abs(lin) / self._max_linear)
+                r_prox = -self._r_prox_scale * t * t * speed_w
 
             # heading penalty: scaled |angle_to_goal|/pi
-            yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
             dx = self._goal_pos[0] - pos.x
             dy = self._goal_pos[1] - pos.y
             angle_robot = _wrap_angle(math.atan2(dy, dx) - yaw)
@@ -424,7 +501,12 @@ class BarnEnv(gym.Env):
                 ratio = min(path_dev, self._path_max_dev) / self._path_max_dev
                 r_path = -self._r_path_scale * ratio
 
-        reward = r_step + r_progress + r_prox + r_heading + r_path
+            # Reversing: small per-step cost so backing out of a trap stays
+            # cheap but driving the course backwards does not pay.
+            if lin < 0.0:
+                r_reverse = -self._r_reverse_scale * (abs(lin) / self._max_linear)
+
+        reward = r_step + r_progress + r_prox + r_heading + r_path + r_reverse
         self._prev_dist = curr_dist
 
         terminated = truncated = False
@@ -444,6 +526,30 @@ class BarnEnv(gym.Env):
             else:
                 outcome = "running"
 
+        # Zero the shaping potential at genuine terminal states.
+        #
+        # Progress shaping is Phi(s) = -progress_scale * dist, so the per-step
+        # term is Phi(s') - Phi(s) and the episode telescopes to
+        # Phi(s_T) - Phi(s_0).  Ng et al. (1999) policy invariance needs
+        # Phi(s_T) = 0, which makes the total shaping the constant
+        # +progress_scale * d_0 for every trajectory — that is what stops the
+        # shaping from ranking outcomes on its own.
+        #
+        # Forcing Phi(s_T) = 0 therefore means ADDING BACK the potential still
+        # sitting in the terminal state, +progress_scale * dist.  The sign
+        # matters enormously: the first cut of this subtracted it instead,
+        # which is off by 2 * progress_scale * dist (150 points at 6 m).  That
+        # turned an early failure into a -85 catastrophe against a -63 freeze
+        # and taught the policy to stop dead mid-course — timeouts went 2.5% ->
+        # 17% and the robot sat still for the rest of the episode.
+        #
+        # Not applied on truncation: a time limit is a bootstrap cutoff, not a
+        # terminal state, so the critic accounts for the remaining potential
+        # through V(s_final).
+        if terminated and self._r_shaping and self._terminal_potential_zero:
+            r_terminal_phi = self._r_progress_scale * curr_dist
+            reward += r_terminal_phi
+
         self._episode_reward += reward
 
         info: Dict[str, Any] = {
@@ -454,6 +560,12 @@ class BarnEnv(gym.Env):
             "collided": collided,
             "outcome": outcome,
             "episode_reward": self._episode_reward,
+            # Travel-arc clearance in metres and the fraction of sectors that
+            # were directly measured this step.  A low fresh_frac alongside a
+            # small min_range means the memory is carrying the near field —
+            # exactly the situation the old observation reported as "clear".
+            "min_range_m": min_range_m,
+            "fresh_frac": float(np.mean(self._fresh_mask)) if self._fresh_mask.size else 1.0,
             "reward_components": {
                 "step": r_step,
                 "progress": r_progress,
@@ -461,6 +573,8 @@ class BarnEnv(gym.Env):
                 "heading": r_heading,
                 "path": r_path,
                 "path_dev_m": path_dev,
+                "reverse": r_reverse,
+                "terminal_phi": r_terminal_phi,
             },
         }
 
@@ -680,6 +794,12 @@ class BarnEnv(gym.Env):
                 pass  # already initialised in this process
 
             self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+            self._mem_cloud_pub = rospy.Publisher(
+                _MEM_CLOUD_TOPIC, PointCloud2, queue_size=1)
+            self._fused_scan_pub = rospy.Publisher(
+                _FUSED_SCAN_TOPIC, LaserScan, queue_size=1)
+            self._ref_path_pub = rospy.Publisher(
+                _REF_PATH_TOPIC, Path, queue_size=1)
             rospy.Subscriber(
                 self._scan_topic, LaserScan, self._scan_cb, queue_size=1,
                 buff_size=2 ** 20,
@@ -688,9 +808,22 @@ class BarnEnv(gym.Env):
 
     def _scan_cb(self, msg: LaserScan):
         ranges = np.array(msg.ranges, dtype=np.float32)
-        # Replace NaN / Inf (use_inf=true in the launch means inf = max range)
-        ranges = np.where(np.isfinite(ranges), ranges, msg.range_max)
-        ranges = np.clip(ranges, msg.range_min, msg.range_max)
+        # A non-finite ray means "no return", which has two very different
+        # causes: the beam found nothing out to range_max, or it hit something
+        # closer than range_min (0.45 m) and was discarded.  The old code
+        # mapped both to range_max — so an obstacle 6 cm from the bumper read
+        # as 10 m of open space, the single most dangerous reading possible.
+        #
+        # NaN is preserved here so ScanMemory can tell "unknown" from "clear"
+        # and fill the near field from the point store.  Every consumer must
+        # therefore be NaN-aware; get_scan_info() re-sanitises on the way out
+        # for the classical controllers, which expect finite ranges.
+        invalid = (
+            ~np.isfinite(ranges)
+            | (ranges < msg.range_min)
+            | (ranges > msg.range_max)
+        )
+        ranges[invalid] = np.nan
         with self._scan_lock:
             self._latest_scan = ranges
             self._scan_angle_min = float(msg.angle_min)
@@ -740,6 +873,7 @@ class BarnEnv(gym.Env):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_scan_normalised(self) -> np.ndarray:
+        """Instantaneous scan only — no memory. Kept for tests and ablations."""
         with self._scan_lock:
             raw = self._latest_scan
         if raw is None:
@@ -747,11 +881,48 @@ class BarnEnv(gym.Env):
 
         # Min-pool into num_scan_rays sectors: unlike linear interpolation,
         # a thin obstacle hit by a single raw ray can never disappear.
+        # NaN (no return) is treated as max range here; the memory path in
+        # _fuse_scan() is what resolves the near-field ambiguity properly.
+        raw = np.where(np.isfinite(raw), raw, self._scan_max_range)
         pooled = _min_pool(raw, self.num_scan_rays)
         return np.clip(pooled / self._scan_norm_range, 0.0, 1.0).astype(np.float32)
 
-    def _build_obs(self) -> Dict[str, np.ndarray]:
-        scan = self._get_scan_normalised()
+    def _fuse_scan(self, x: float, y: float, yaw: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-sector range in metres, fused with the near-field memory.
+
+        Returns (fused_metres, fresh_mask). Without memory the fresh mask is
+        all-ones and the fused ranges come straight from the current scan.
+        """
+        with self._scan_lock:
+            raw = self._latest_scan.copy() if self._latest_scan is not None else None
+            ang_min = self._scan_angle_min
+            ang_inc = self._scan_angle_increment
+
+        if self._scan_mem is None:
+            if raw is None:
+                return (np.full(self.num_scan_rays, self._scan_max_range, np.float32),
+                        np.ones(self.num_scan_rays, dtype=np.float32))
+            raw = np.where(np.isfinite(raw), raw, self._scan_max_range)
+            pooled = _min_pool(raw, self.num_scan_rays).astype(np.float32)
+            return pooled, np.ones(self.num_scan_rays, dtype=np.float32)
+
+        return self._scan_mem.update(
+            x, y, yaw, raw, ang_min, ang_inc, self._scan_max_range,
+        )
+
+    def _build_obs(self, pose: Optional[Tuple[float, float, float]] = None
+                   ) -> Dict[str, np.ndarray]:
+        if pose is None:
+            state = self._gazebo_sim.get_model_state()
+            p, o = state.pose.position, state.pose.orientation
+            pose = (p.x, p.y, _quat_to_yaw(o.x, o.y, o.z, o.w))
+        px, py, yaw = pose
+
+        fused_m, fresh = self._fuse_scan(px, py, yaw)
+        self._fused_m = fused_m
+        self._fresh_mask = fresh
+        self._publish_debug(px, py, yaw)
+        scan = np.clip(fused_m / self._scan_norm_range, 0.0, 1.0).astype(np.float32)
 
         # Maintain the frame stack: seed with K copies on the first frame of
         # an episode (history is cleared in reset()), append afterwards.
@@ -760,15 +931,13 @@ class BarnEnv(gym.Env):
                 self._scan_history.append(scan)
         else:
             self._scan_history.append(scan)
-        scan_stack = np.stack(self._scan_history).astype(np.float32)
+        rows = list(self._scan_history)
+        if self._scan_mem is not None:
+            rows.append(fresh)
+        scan_stack = np.stack(rows).astype(np.float32)
 
-        state = self._gazebo_sim.get_model_state()
-        pos = state.pose.position
-        ori = state.pose.orientation
-
-        yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
-        dx = self._goal_pos[0] - pos.x
-        dy = self._goal_pos[1] - pos.y
+        dx = self._goal_pos[0] - px
+        dy = self._goal_pos[1] - py
         dist = math.sqrt(dx * dx + dy * dy)
         dist_norm = float(np.clip(dist / self._max_dist, 0.0, 1.0))
 
@@ -776,7 +945,7 @@ class BarnEnv(gym.Env):
         sin_a = math.sin(angle_robot)
         cos_a = math.cos(angle_robot)
 
-        last_lin_norm = float(np.clip(self._last_action[0] / self._max_linear, 0.0, 1.0))
+        last_lin_norm = float(np.clip(self._last_action[0] / self._max_linear, -1.0, 1.0))
         last_ang_norm = float(np.clip(self._last_action[1] / self._max_angular, -1.0, 1.0))
 
         return {
@@ -786,6 +955,85 @@ class BarnEnv(gym.Env):
                 dtype=np.float32,
             ),
         }
+
+    def _publish_debug(self, x: float, y: float, yaw: float):
+        """Publish the scan memory and the fused sector ranges for RViz.
+
+        /rl/scan_memory : PointCloud2 in base_link, intensity = age in steps
+                          since the point was last measured (0 = seen now).
+        /rl/fused_scan  : LaserScan in base_link, one ray per sector — exactly
+                          the ranges the policy observes, blind ring filled in.
+        /rl/ref_path    : Path in base_link — the A* reference polyline the
+                          path-deviation penalty is measured against.
+        """
+        self._publish_ref_path(x, y, yaw)
+        if self._scan_mem is None or self._mem_cloud_pub is None:
+            return
+        want_cloud = self._mem_cloud_pub.get_num_connections() > 0
+        want_scan = self._fused_scan_pub.get_num_connections() > 0
+        if not (want_cloud or want_scan):
+            return
+        header = Header(stamp=rospy.Time.now(), frame_id="base_link")
+
+        if want_cloud:
+            pts, age = self._scan_mem.snapshot()
+            # World → base_link so the cloud needs no odom/world TF.
+            dx, dy = pts[:, 0] - x, pts[:, 1] - y
+            c, s = math.cos(yaw), math.sin(yaw)
+            bx = c * dx + s * dy
+            by = -s * dx + c * dy
+            bz = np.full(len(pts), _DEBUG_Z)
+            fields = [
+                PointField("x", 0, PointField.FLOAT32, 1),
+                PointField("y", 4, PointField.FLOAT32, 1),
+                PointField("z", 8, PointField.FLOAT32, 1),
+                PointField("intensity", 12, PointField.FLOAT32, 1),
+            ]
+            rows = np.stack([bx, by, bz, age], axis=1).astype(np.float32)
+            self._mem_cloud_pub.publish(
+                point_cloud2.create_cloud(header, fields, rows.tolist()))
+
+        if want_scan:
+            centres = self._scan_mem.sector_centres()
+            msg = LaserScan()
+            msg.header = header
+            msg.angle_min = float(centres[0])
+            msg.angle_increment = float(centres[1] - centres[0]) if len(centres) > 1 else 0.0
+            msg.angle_max = float(centres[-1])
+            msg.range_min = 0.0
+            msg.range_max = float(self._scan_max_range)
+            msg.ranges = self._fused_m.astype(float).tolist()
+            # 1 = measured this step, 0 = filled in from memory.
+            msg.intensities = self._fresh_mask.astype(float).tolist()
+            self._fused_scan_pub.publish(msg)
+
+    def _publish_ref_path(self, x: float, y: float, yaw: float):
+        if (self._ref_path is None or self._ref_path_pub is None
+                or self._ref_path_pub.get_num_connections() == 0):
+            return
+        header = Header(stamp=rospy.Time.now(), frame_id="base_link")
+        # World → base_link so the path needs no odom/world TF.
+        dx = self._ref_path[:, 0] - x
+        dy = self._ref_path[:, 1] - y
+        c, s = math.cos(yaw), math.sin(yaw)
+        msg = Path(header=header)
+        for bx, by in zip(c * dx + s * dy, -s * dx + c * dy):
+            ps = PoseStamped(header=header)
+            ps.pose.position.x = float(bx)
+            ps.pose.position.y = float(by)
+            ps.pose.position.z = _DEBUG_Z
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+        self._ref_path_pub.publish(msg)
+
+    def _travel_min_m(self, lin: float = 0.0) -> float:
+        """Closest fused range in metres within the arc around the direction
+        of travel — forward, or rearward when `lin` < 0."""
+        if self._scan_mem is not None:
+            centre = math.pi if lin < 0.0 else 0.0
+            return self._scan_mem.arc_min(self._fused_m, RLEnvConfig.PROX_ARC,
+                                          centre=centre)
+        return float(np.min(self._fused_m)) if self._fused_m.size else float("inf")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -815,6 +1063,12 @@ class BarnEnv(gym.Env):
         """
         with self._scan_lock:
             ranges = self._latest_scan.copy() if self._latest_scan is not None else None
+        if ranges is not None:
+            # _scan_cb stores NaN for "no return" so ScanMemory can distinguish
+            # a near-field dropout from open space.  MPPI / DWA expect finite
+            # ranges, so collapse both cases to max range for them — they run
+            # their own costmaps and never see the blind ring anyway.
+            ranges = np.where(np.isfinite(ranges), ranges, self._scan_max_range)
         return ranges, self._scan_angle_min, self._scan_angle_increment, self._scan_max_range
 
     def get_pose(self) -> Tuple[float, float, float]:

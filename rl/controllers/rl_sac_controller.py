@@ -161,15 +161,35 @@ class SACController:
         # ── Detect obs format from the checkpoint itself ──────────────────────
         obs_space = self._model.observation_space
         self._dict_obs = isinstance(obs_space, gym.spaces.Dict)
+        self._scan_mem = None
         if self._dict_obs:
             # Shapes come from the model, so a checkpoint trained with
             # non-default stack/sector counts still works.
-            self._scan_stack, self._num_scan_rays = obs_space["scan"].shape
+            rows, self._num_scan_rays = obs_space["scan"].shape
+            # Scan memory appends one channel (the "directly measured this
+            # step" mask), so a memory-trained checkpoint has SCAN_STACK + 1
+            # rows.  Infer it from the shape rather than trusting the current
+            # config, which may have moved on since the checkpoint was saved.
+            self._use_memory = rows == RLEnvConfig.SCAN_STACK + 1
+            self._scan_stack = rows - 1 if self._use_memory else rows
             self._scan_norm_range = min(
                 RLEnvConfig.SCAN_CLIP_RANGE, self._scan_max_range
             )
             self._scan_history: deque = deque(maxlen=self._scan_stack)
+            if self._use_memory:
+                from rl.env.scan_memory import ScanMemory
+                self._scan_mem = ScanMemory(
+                    num_sectors=self._num_scan_rays,
+                    blind_radius=RLEnvConfig.SCAN_BLIND_RADIUS,
+                    mem_radius=RLEnvConfig.SCAN_MEM_RADIUS,
+                    voxel=RLEnvConfig.SCAN_MEM_VOXEL,
+                    max_age_steps=RLEnvConfig.SCAN_MEM_MAX_AGE,
+                )
+                print("[SACController] near-field scan memory ON "
+                      "(%d sectors, blind radius %.2f m)"
+                      % (self._num_scan_rays, RLEnvConfig.SCAN_BLIND_RADIUS))
         else:
+            self._use_memory = False
             # Legacy flat obs: [scan(N), dist, sin, cos, last_lin, last_ang]
             self._num_scan_rays = obs_space.shape[0] - 5
             self._scan_norm_range = self._scan_max_range
@@ -191,9 +211,18 @@ class SACController:
 
     # ── API ───────────────────────────────────────────────────────────────────
 
+    # Tells BenchmarkEnv to hand over the NaN-preserving scan: this controller
+    # needs to know which rays gave no return so ScanMemory can fill the
+    # near-field blind ring instead of reading it as open space.
+    @property
+    def wants_raw_scan(self) -> bool:
+        return self._scan_mem is not None
+
     def reset(self):
         self._last_action[:] = 0.0
         self._scan_history.clear()
+        if self._scan_mem is not None:
+            self._scan_mem.reset()
 
     def set_goal(self, goal_x: float, goal_y: float):
         self._goal[:] = [goal_x, goal_y]
@@ -208,7 +237,10 @@ class SACController:
         scan_angle_increment: float,
         scan_max_range: float,
     ) -> np.ndarray:
-        obs = self._build_obs(robot_x, robot_y, robot_theta, scan_ranges)
+        obs = self._build_obs(
+            robot_x, robot_y, robot_theta,
+            scan_ranges, scan_angle_min, scan_angle_increment,
+        )
         action, _ = self._model.predict(obs, deterministic=self._deterministic)
         action = np.asarray(action, dtype=np.float32)
         self._last_action[:] = action
@@ -216,12 +248,29 @@ class SACController:
 
     # ── Observation reconstruction (mirrors BarnEnv._build_obs) ───────────────
 
-    def _scan_frame(self, scan_ranges) -> np.ndarray:
-        """One normalised scan frame at the training-time sector count."""
+    def _scan_frame(self, scan_ranges, x, y, theta, angle_min, angle_increment):
+        """One normalised scan frame at the training-time sector count.
+
+        Returns (frame, fresh) where `fresh` is None unless scan memory is on.
+        """
         scan = np.asarray(scan_ranges, dtype=np.float32)
         if scan.size == 0:
             scan = np.full(self._num_scan_rays, self._scan_max_range, dtype=np.float32)
 
+        if self._scan_mem is not None:
+            # Identical fusion to BarnEnv: NaN rays are filled from the
+            # egocentric point store, so a sector inside the blind ring
+            # reports its remembered range rather than max range.
+            fused, fresh = self._scan_mem.update(
+                x, y, theta, scan, angle_min, angle_increment,
+                self._scan_max_range,
+            )
+            frame = np.clip(fused / self._scan_norm_range, 0.0, 1.0)
+            return frame.astype(np.float32), fresh.astype(np.float32)
+
+        # No memory: NaN means "no return", which without a store is
+        # indistinguishable from open space.
+        scan = np.where(np.isfinite(scan), scan, self._scan_max_range)
         if self._dict_obs:
             from rl.env.barn_env import _min_pool
             scan = _min_pool(scan, self._num_scan_rays)
@@ -232,10 +281,13 @@ class SACController:
 
         # Normalise using the policy's training-time range (NOT the
         # ROS-provided max_range, which may differ between scan sources).
-        return np.clip(scan / self._scan_norm_range, 0.0, 1.0).astype(np.float32)
+        return np.clip(scan / self._scan_norm_range, 0.0, 1.0).astype(np.float32), None
 
-    def _build_obs(self, robot_x, robot_y, robot_theta, scan_ranges):
-        frame = self._scan_frame(scan_ranges)
+    def _build_obs(self, robot_x, robot_y, robot_theta, scan_ranges,
+                   angle_min=-math.pi, angle_increment=0.0087):
+        frame, fresh = self._scan_frame(
+            scan_ranges, robot_x, robot_y, robot_theta, angle_min, angle_increment
+        )
 
         dx = float(self._goal[0]) - robot_x
         dy = float(self._goal[1]) - robot_y
@@ -246,7 +298,9 @@ class SACController:
         sin_a = math.sin(angle_robot)
         cos_a = math.cos(angle_robot)
 
-        last_lin_norm = float(np.clip(self._last_action[0] / self._max_linear, 0.0, 1.0))
+        # [-1, 1]: reverse-capable policies emit negative linear velocity;
+        # forward-only checkpoints never do, so this is identical for them.
+        last_lin_norm = float(np.clip(self._last_action[0] / self._max_linear, -1.0, 1.0))
         last_ang_norm = float(np.clip(self._last_action[1] / self._max_angular, -1.0, 1.0))
 
         state = [dist_norm, sin_a, cos_a, last_lin_norm, last_ang_norm]
@@ -262,8 +316,12 @@ class SACController:
         else:
             self._scan_history.append(frame)
 
+        rows = list(self._scan_history)
+        if fresh is not None:
+            rows.append(fresh)
+
         return {
-            "scan": np.stack(self._scan_history).astype(np.float32),
+            "scan": np.stack(rows).astype(np.float32),
             "state": np.array(state, dtype=np.float32),
         }
 

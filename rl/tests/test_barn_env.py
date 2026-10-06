@@ -39,7 +39,9 @@ def _make_env(**kwargs) -> "BarnEnv":
 class TestObservationSpace:
     """
     Dict obs:
-      "scan"  : (SCAN_STACK, N) stacked min-pooled frames, [0, 1]
+      "scan"  : (SCAN_STACK [+1], N) stacked min-pooled frames, [0, 1].
+                The +1 row is the "directly measured this step" mask that
+                scan memory appends.
       "state" : (5,) [dist_norm, sin(angle), cos(angle), last_lin, last_ang]
     """
 
@@ -52,13 +54,20 @@ class TestObservationSpace:
     def test_default_scan_shape(self):
         from configs.rl_config import RLEnvConfig
         env = _make_env()
+        extra = 1 if RLEnvConfig.SCAN_MEMORY else 0
         assert env.observation_space["scan"].shape == (
-            RLEnvConfig.SCAN_STACK, RLEnvConfig.NUM_SCAN_RAYS
+            RLEnvConfig.SCAN_STACK + extra, RLEnvConfig.NUM_SCAN_RAYS
         )
 
     def test_custom_scan_rays_and_stack(self):
-        env = _make_env(num_scan_rays=180, scan_stack=4)
+        env = _make_env(num_scan_rays=180, scan_stack=4, scan_memory=False)
         assert env.observation_space["scan"].shape == (4, 180)
+
+    def test_memory_adds_one_channel(self):
+        plain = _make_env(num_scan_rays=90, scan_stack=3, scan_memory=False)
+        withmem = _make_env(num_scan_rays=90, scan_stack=3, scan_memory=True)
+        assert plain.observation_space["scan"].shape == (3, 90)
+        assert withmem.observation_space["scan"].shape == (4, 90)
 
     def test_scan_bounds_zero_to_one(self):
         env = _make_env(num_scan_rays=360)
@@ -70,8 +79,8 @@ class TestObservationSpace:
         env = _make_env()
         state_space = env.observation_space["state"]
         assert state_space.shape == (5,)
-        # [dist, sin, cos, last_lin, last_ang]
-        assert np.allclose(state_space.low,  [0.0, -1.0, -1.0, 0.0, -1.0])
+        # [dist, sin, cos, last_lin, last_ang] — last_lin < 0 when reversing
+        assert np.allclose(state_space.low,  [0.0, -1.0, -1.0, -1.0, -1.0])
         assert np.allclose(state_space.high, [1.0,  1.0,  1.0, 1.0,  1.0])
 
     def test_dtype_is_float32(self):
@@ -87,8 +96,10 @@ class TestObservationSpace:
 class TestActionSpace:
     def test_moborobo_linear_range(self):
         from configs.config import MoboroboConfig
+        from configs.rl_config import RLEnvConfig
         env = _make_env(robot="moborobo")
-        assert env.action_space.low[0] == pytest.approx(0.0)
+        assert env.action_space.low[0] == pytest.approx(
+            -RLEnvConfig.REVERSE_SPEED_RATIO * MoboroboConfig.MAX_LINEAR_VEL)
         assert env.action_space.high[0] == pytest.approx(MoboroboConfig.MAX_LINEAR_VEL)
 
     def test_moborobo_angular_range(self):
@@ -102,9 +113,12 @@ class TestActionSpace:
         env = _make_env(robot="jackal")
         assert env.action_space.high[0] == pytest.approx(RobotConfig.MAX_LINEAR_VEL)
 
-    def test_forward_only_lower_bound(self):
-        # Linear velocity lower bound is 0 (robot cannot reverse)
+    def test_reverse_allowed(self):
         env = _make_env()
+        assert env.action_space.low[0] < 0.0
+
+    def test_reverse_ratio_zero_is_forward_only(self):
+        env = _make_env(reverse_speed_ratio=0.0)
         assert env.action_space.low[0] == pytest.approx(0.0)
 
     def test_random_samples_stay_in_bounds(self):
@@ -305,6 +319,302 @@ class TestMinPool:
         out = _min_pool(x, 90)
         assert out.shape == (90,)
         assert np.allclose(out, 3.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Scan memory — near-field blind ring
+# ═════════════════════════════════════════════════════════════════════════════
+
+_BLIND = 0.45
+_NRAYS = 722
+_AMIN = -math.pi
+_AINC = 2 * math.pi / _NRAYS
+_RMAX = 10.0
+
+
+def _fake_scan(x, y, theta, obstacles, blind=_BLIND):
+    """Synthetic LiDAR returning NaN where the real sensor gives no return.
+
+    Mirrors the moborobo pipeline: anything closer than `blind` is dropped by
+    pointcloud_to_laserscan (range_min 0.45) and arrives as inf, which
+    BarnEnv._scan_cb stores as NaN.
+    """
+    r = np.full(_NRAYS, np.nan, dtype=np.float64)
+    for ox, oy in obstacles:
+        dx, dy = ox - x, oy - y
+        rng = math.hypot(dx, dy)
+        if rng < blind or rng > _RMAX:
+            continue
+        bearing = (math.atan2(dy, dx) - theta + math.pi) % (2 * math.pi) - math.pi
+        idx = int(round((bearing - _AMIN) / _AINC)) % _NRAYS
+        if np.isnan(r[idx]) or rng < r[idx]:
+            r[idx] = rng
+    return r
+
+
+class TestScanMemory:
+    """The whole point: a sector that goes blind must report the remembered
+    range, not max range. The old pipeline reported 10 m at the exact moment
+    the robot was about to hit something."""
+
+    def _mem(self, **kw):
+        from rl.env.scan_memory import ScanMemory
+        kw.setdefault("num_sectors", 90)
+        kw.setdefault("blind_radius", _BLIND)
+        m = ScanMemory(**kw)
+        m.reset()
+        return m
+
+    def test_tracks_obstacle_into_the_blind_ring(self):
+        mem = self._mem()
+        theta = math.pi / 2                      # facing +y
+        obst = [(0.0, 1.0)]
+        fused = None
+        for y in np.arange(0.0, 0.71, 0.05):
+            raw = _fake_scan(0.0, y, theta, obst)
+            fused, _ = mem.update(0.0, y, theta, raw, _AMIN, _AINC, _RMAX)
+        # Robot at y=0.70 → obstacle is 0.30 m ahead, well inside the blind
+        # ring, so the raw scan carries nothing at all.
+        raw = _fake_scan(0.0, 0.70, theta, obst)
+        assert not np.isfinite(raw).any(), "sensor should be blind here"
+        assert mem.arc_min(fused, 2.0944) == pytest.approx(0.30, abs=0.02)
+
+    def test_naive_sanitisation_would_have_said_free(self):
+        # Documents the bug this class exists to fix.
+        raw = _fake_scan(0.0, 0.70, math.pi / 2, [(0.0, 1.0)])
+        naive = np.where(np.isfinite(raw), raw, _RMAX).min()
+        assert naive == pytest.approx(_RMAX), (
+            "obstacle 0.30 m away read as %.1f m of open space" % naive
+        )
+
+    def test_fresh_mask_false_inside_blind_ring(self):
+        mem = self._mem()
+        theta = math.pi / 2
+        obst = [(0.0, 1.0)]
+        _, fresh_far = mem.update(0.0, 0.0, theta,
+                                  _fake_scan(0.0, 0.0, theta, obst),
+                                  _AMIN, _AINC, _RMAX)
+        _, fresh_near = mem.update(0.0, 0.70, theta,
+                                   _fake_scan(0.0, 0.70, theta, obst),
+                                   _AMIN, _AINC, _RMAX)
+        ahead = 45      # bearing 0 with 90 sectors over [-pi, pi)
+        assert fresh_far[ahead] == pytest.approx(1.0)
+        assert fresh_near[ahead] == pytest.approx(0.0)
+
+    def test_raycast_clears_a_contradicted_point(self):
+        mem = self._mem()
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 1.0)]),
+                   _AMIN, _AINC, _RMAX)
+        assert mem.num_points == 1
+        # Now every ray sees 5 m — the remembered point cannot be there.
+        fused, _ = mem.update(0.0, 0.0, theta, np.full(_NRAYS, 5.0),
+                              _AMIN, _AINC, _RMAX)
+        assert mem.arc_min(fused, 2.0944) == pytest.approx(5.0, abs=0.01)
+
+    def test_raycast_does_not_clear_inside_the_blind_ring(self):
+        # A point the sensor cannot see is not evidence of absence — this
+        # exception is what makes the memory survive where it is needed.
+        mem = self._mem()
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 0.6)]),
+                   _AMIN, _AINC, _RMAX)
+        fused, _ = mem.update(0.0, 0.25, theta, np.full(_NRAYS, 5.0),
+                              _AMIN, _AINC, _RMAX)
+        assert mem.arc_min(fused, 2.0944) == pytest.approx(0.35, abs=0.02)
+
+    def test_forward_arc_ignores_obstacles_already_passed(self):
+        mem = self._mem()
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 1.0)]),
+                   _AMIN, _AINC, _RMAX)
+        # drive 1.30 m: the cylinder is now 0.30 m BEHIND
+        fused, _ = mem.update(0.0, 1.30, theta, np.full(_NRAYS, 5.0),
+                              _AMIN, _AINC, _RMAX)
+        assert float(np.min(fused)) == pytest.approx(0.30, abs=0.02)
+        assert mem.arc_min(fused, 2.0944) > 1.0
+        # ...but it is exactly what matters when reversing into it.
+        assert mem.arc_min(fused, 2.0944, centre=math.pi) == pytest.approx(0.30, abs=0.02)
+
+    def test_points_outside_mem_radius_are_dropped(self):
+        mem = self._mem(mem_radius=1.0)
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 0.9)]),
+                   _AMIN, _AINC, _RMAX)
+        assert mem.num_points == 1
+        mem.update(0.0, -2.0, theta, np.full(_NRAYS, np.nan),
+                   _AMIN, _AINC, _RMAX)
+        assert mem.num_points == 0
+
+    def test_points_age_out(self):
+        mem = self._mem(max_age_steps=3)
+        theta = math.pi / 2
+        # Seed a point inside the blind ring so raycast clearing cannot remove
+        # it — only ageing can.
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 0.5)]),
+                   _AMIN, _AINC, _RMAX)
+        mem.update(0.0, 0.15, theta, np.full(_NRAYS, np.nan), _AMIN, _AINC, _RMAX)
+        assert mem.num_points == 1
+        for _ in range(5):
+            mem.update(0.0, 0.15, theta, np.full(_NRAYS, np.nan),
+                       _AMIN, _AINC, _RMAX)
+        assert mem.num_points == 0
+
+    def test_voxel_dedup_bounds_the_store(self):
+        mem = self._mem(voxel=0.05)
+        theta = math.pi / 2
+        obst = [(0.0, 1.0), (0.3, 1.2), (-0.4, 0.9)]
+        for _ in range(50):
+            mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, obst),
+                       _AMIN, _AINC, _RMAX)
+        assert mem.num_points == len(obst), (
+            "repeated sightings of the same 3 points should collapse, got %d"
+            % mem.num_points
+        )
+
+    def test_reset_empties_the_store(self):
+        mem = self._mem()
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 1.0)]),
+                   _AMIN, _AINC, _RMAX)
+        assert mem.num_points > 0
+        mem.reset()
+        assert mem.num_points == 0
+
+    def test_none_scan_falls_back_to_memory(self):
+        mem = self._mem()
+        theta = math.pi / 2
+        mem.update(0.0, 0.0, theta, _fake_scan(0.0, 0.0, theta, [(0.0, 1.0)]),
+                   _AMIN, _AINC, _RMAX)
+        fused, fresh = mem.update(0.0, 0.0, theta, None, _AMIN, _AINC, _RMAX)
+        assert mem.arc_min(fused, 2.0944) == pytest.approx(1.0, abs=0.02)
+        assert not fresh.any()
+
+    def test_empty_sectors_report_range_max(self):
+        mem = self._mem()
+        fused, _ = mem.update(0.0, 0.0, 0.0, None, _AMIN, _AINC, _RMAX)
+        assert np.allclose(fused, _RMAX)
+
+    def test_update_is_fast_enough_for_the_control_loop(self):
+        import time
+        mem = self._mem()
+        rng = np.random.default_rng(0)
+        obst = [(rng.uniform(-3, 3), rng.uniform(-3, 3)) for _ in range(60)]
+        theta = math.pi / 2
+        scans = [_fake_scan(0.0, i * 0.02, theta, obst) for i in range(30)]
+        t0 = time.time()
+        for i, s in enumerate(scans):
+            mem.update(0.0, i * 0.02, theta, s, _AMIN, _AINC, _RMAX)
+        per_step = (time.time() - t0) / len(scans)
+        # STEP_DURATION is 0.1 s; the memory must be a rounding error in that.
+        assert per_step < 0.01, "%.1f ms per update" % (per_step * 1000)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Reverse driving + reward wiring
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestRewardConfig:
+    def test_reverse_params_stored(self):
+        env = _make_env(reverse_speed_ratio=0.25, reward_reverse_scale=0.1)
+        assert env._max_reverse == pytest.approx(0.25 * env._max_linear)
+        assert env._r_reverse_scale == pytest.approx(0.1)
+
+    def test_reverse_penalty_is_small_against_progress(self):
+        # Backing out of a trap must stay cheap: a full-speed reverse step
+        # should cost well under one full-speed forward step of progress.
+        from configs.rl_config import RLEnvConfig as C
+        assert 0.0 <= C.REWARD_REVERSE_SCALE * C.REVERSE_SPEED_RATIO < 0.25
+
+    def test_memory_disabled_leaves_no_scan_memory(self):
+        env = _make_env(scan_memory=False)
+        assert env._scan_mem is None
+
+    def test_memory_enabled_creates_matching_sector_count(self):
+        env = _make_env(num_scan_rays=120, scan_memory=True)
+        assert env._scan_mem is not None
+        assert env._scan_mem.num_sectors == 120
+
+    def test_terminal_potential_flag_stored(self):
+        assert _make_env(terminal_potential_zero=False)._terminal_potential_zero is False
+        assert _make_env(terminal_potential_zero=True)._terminal_potential_zero is True
+
+    def test_total_shaping_is_independent_of_where_the_episode_ends(self):
+        # THE property that makes progress shaping policy-invariant (Ng et al.
+        # 1999): with Phi(terminal) = 0 the shaping telescopes to the constant
+        # +scale * d_0 no matter how the episode ends, so it cannot rank
+        # outcomes on its own — only the base rewards do that.
+        #
+        # Getting the correction's sign wrong silently breaks this: subtracting
+        # the terminal potential instead of adding it leaves
+        # scale*(d_0 - 2*d_T), which punishes failing early far harder than
+        # failing late and taught the policy to stop dead mid-course.
+        from configs.rl_config import RLEnvConfig as C
+        scale = C.reward_progress_scale("moborobo")
+        d0 = 10.0
+
+        def total_shaping(d_end):
+            banked = scale * (d0 - d_end)          # summed per-step progress
+            correction = scale * d_end             # zeroing Phi at the terminal
+            return banked + correction
+
+        totals = [total_shaping(d) for d in (0.0, 1.0, 3.0, 6.05, 9.5)]
+        assert all(t == pytest.approx(scale * d0) for t in totals), totals
+
+    def test_outcome_ranking_is_set_by_base_rewards_alone(self):
+        # Follows from the invariant above: once shaping contributes the same
+        # constant everywhere, success > timeout > collision has to come from
+        # the terminal rewards.
+        from configs.rl_config import RLEnvConfig as C
+        assert C.REWARD_GOAL > 0.0
+        assert 0.0 > C.REWARD_COLLISION
+
+    def test_path_penalty_keeps_a_gradient_at_the_observed_deviation(self):
+        # A clipped penalty has zero derivative, so once the robot is past
+        # PATH_MAX_DEV the term stops saying which way to steer and becomes a
+        # flat tax. Measured mean deviation is 0.449 m and the max reaches
+        # 1.2 m, so the clip has to sit above the operating range.
+        from configs.rl_config import RLEnvConfig as C
+        assert C.PATH_MAX_DEV > 0.449 * 2, (
+            "PATH_MAX_DEV=%.2f saturates at the observed mean deviation"
+            % C.PATH_MAX_DEV
+        )
+
+    @pytest.mark.parametrize("script", ["train_sac.py", "train_ppo.py"])
+    def test_discount_horizon_covers_the_course(self, script):
+        # At 10 Hz an effective horizon of 1/(1-gamma) steps must reach the
+        # goal, or the goal reward is discounted into irrelevance and the
+        # policy optimises dense shaping alone — which is what made it freeze
+        # mid-course. Read the default out of the source rather than importing
+        # the trainer (which would pull in SB3 and ROS).
+        import re
+        from configs.rl_config import RLEnvConfig as C
+        src = open(os.path.join(_ROOT, script)).read()
+        m = re.search(r'"--gamma".*?default=([0-9.]+)', src, re.S)
+        assert m, "could not find the --gamma default in %s" % script
+        gamma = float(m.group(1))
+        horizon = 1.0 / (1.0 - gamma)
+        assert horizon >= 0.9 * C.max_episode_steps("moborobo"), (
+            "%s gamma=%.4f gives a %.0f-step horizon, shorter than the "
+            "%d-step episode" % (script, gamma, horizon,
+                                 C.max_episode_steps("moborobo"))
+        )
+
+    def test_prox_penalty_is_comparable_to_progress_at_the_floor(self):
+        # It used to peak at -0.0275/step against +0.25/step of progress, a
+        # 9:1 ratio the policy correctly ignored.
+        from configs.rl_config import RLEnvConfig as C
+        max_progress = C.reward_progress_scale("moborobo") * 0.2 * C.STEP_DURATION
+        worst_prox = C.REWARD_PROX_SCALE          # t=1, full speed
+        assert worst_prox >= 0.4 * max_progress
+
+    def test_path_penalty_no_longer_noise(self):
+        # At the deviation the old policy actually ran (~0.40 m) the penalty
+        # must be a real cost, not the -0.008/step it used to be.
+        from configs.rl_config import RLEnvConfig as C
+        dev = 0.40
+        pen = C.REWARD_PATH_SCALE * min(dev, C.PATH_MAX_DEV) / C.PATH_MAX_DEV
+        assert pen > 0.05
 
 
 # ═════════════════════════════════════════════════════════════════════════════
