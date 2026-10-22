@@ -1,0 +1,115 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Robot Description: robot_description
+      Alpha: 0.6
+      Value: true
+    # Raw RS-16 3D point cloud (Gazebo plugin output).
+    - Class: rviz/PointCloud2
+      Name: RS-16 raw (/rs_points)
+      Enabled: true
+      Topic: /rs_points
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Axis: Z
+      Queue Size: 2
+      Decay Time: 0
+      Value: true
+    # 2D scan from pointcloud_to_laserscan (0.45 m blind ring = inf).
+    - Class: rviz/LaserScan
+      Name: 2D scan (/scan)
+      Enabled: true
+      Topic: /scan
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 255; 255
+      Queue Size: 2
+      Decay Time: 0
+      Value: true
+    # BarnEnv scan memory: remembered world points, intensity = age (steps).
+    - Class: rviz/PointCloud2
+      Name: Scan memory (/rl/scan_memory)
+      Enabled: true
+      Topic: /rl/scan_memory
+      Style: Spheres
+      Size (m): 0.04
+      Color Transformer: Intensity
+      Channel Name: intensity
+      Use rainbow: true
+      Autocompute Intensity Bounds: false
+      Min Intensity: 0
+      Max Intensity: 150
+      Queue Size: 2
+      Decay Time: 0
+      Value: true
+    # What the policy observes: one ray per sector, intensity 1 = measured,
+    # 0 = filled in from memory.
+    - Class: rviz/LaserScan
+      Name: Policy view (/rl/fused_scan)
+      Enabled: true
+      Topic: /rl/fused_scan
+      Style: Flat Squares
+      Size (m): 0.06
+      Color Transformer: Intensity
+      Channel Name: intensity
+      Use rainbow: false
+      Min Color: 255; 0; 0
+      Max Color: 0; 255; 0
+      Autocompute Intensity Bounds: false
+      Min Intensity: 0
+      Max Intensity: 1
+      Queue Size: 2
+      Decay Time: 0
+      Value: true
+    # A* reference route used by the path-deviation penalty (r_path).
+    - Class: rviz/Path
+      Name: Reference path (/rl/ref_path)
+      Enabled: true
+      Topic: /rl/ref_path
+      Line Style: Billboards
+      Line Width: 0.05
+      Color: 0; 200; 255
+      Alpha: 1
+      Pose Style: None
+      Queue Size: 2
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 1.2
+      Yaw: 3.14
+      Target Frame: base_link
+      Value: Orbit (rviz)

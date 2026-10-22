@@ -88,6 +88,9 @@ class BenchmarkEnv:
         self._ros_ready       = False
 
         self._scan:          Optional[np.ndarray] = None
+        # Same rays as _scan but with NaN preserved where the sensor gave no
+        # return — see _scan_cb.
+        self._scan_raw:      Optional[np.ndarray] = None
         self._scan_min:      float = -math.pi
         self._scan_inc:      float = 0.0087
         self._scan_lock      = threading.Lock()
@@ -158,6 +161,7 @@ class BenchmarkEnv:
         print("    [setup] Waiting for first scan...")
         with self._scan_lock:
             self._scan = None
+            self._scan_raw = None
         self._wait_for_scan()
         self._gazebo_sim.get_hard_collision()  # drain any collision from spawn/settle
         print("    [setup] Ready — starting navigation.")
@@ -231,11 +235,14 @@ class BenchmarkEnv:
 
             with self._scan_lock:
                 scan = self._scan.copy() if self._scan is not None else None
+                scan_raw = (
+                    self._scan_raw.copy() if self._scan_raw is not None else None
+                )
 
-            if scan is not None:
-                valid = np.isfinite(scan) & (scan > 0.01)
+            if scan_raw is not None:
+                valid = np.isfinite(scan_raw) & (scan_raw > 0.01)
                 if valid.any():
-                    min_clr = min(min_clr, float(scan[valid].min()))
+                    min_clr = min(min_clr, float(scan_raw[valid].min()))
 
             if ref_path is not None:
                 deviations.append(point_to_path_dist(pos, ref_path))
@@ -244,9 +251,17 @@ class BenchmarkEnv:
             if scan is None:
                 scan = np.full(360, self._scan_max_r, dtype=np.float32)
 
+            # Controllers that maintain their own near-field memory (the RL
+            # policy) need the NaN-preserving scan; everything else gets the
+            # sanitised one it has always been given.
+            if getattr(controller, "wants_raw_scan", False) and scan_raw is not None:
+                scan_in = scan_raw
+            else:
+                scan_in = scan
+
             action = controller.compute_action(
                 x, y, theta,
-                scan, self._scan_min, self._scan_inc, self._scan_max_r,
+                scan_in, self._scan_min, self._scan_inc, self._scan_max_r,
             )
             self._pub_cmd(float(action[0]), float(action[1]))
 
@@ -473,10 +488,22 @@ class BenchmarkEnv:
 
     def _scan_cb(self, msg: LaserScan):
         ranges = np.array(msg.ranges, dtype=np.float32)
-        ranges = np.where(np.isfinite(ranges), ranges, msg.range_max)
-        ranges = np.clip(ranges, msg.range_min, msg.range_max)
+        # A non-finite ray means "no return" — either nothing out to range_max,
+        # or something closer than range_min (0.45 m) that was discarded.
+        # `_scan_raw` keeps NaN so a controller with a near-field memory can
+        # tell those apart; `_scan` collapses both to max range because the
+        # classical planners expect finite ranges.
+        invalid = (
+            ~np.isfinite(ranges)
+            | (ranges < msg.range_min)
+            | (ranges > msg.range_max)
+        )
+        raw = ranges.copy()
+        raw[invalid] = np.nan
+        ranges[invalid] = msg.range_max
         with self._scan_lock:
             self._scan     = ranges
+            self._scan_raw = raw
             self._scan_min = float(msg.angle_min)
             self._scan_inc = float(msg.angle_increment)
 

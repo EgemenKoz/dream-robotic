@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!--
+  barn_rl_world.launch — Gazebo with a BARN world and no robot in it.
+
+  Used by MultiRobotBarnVecEnv (rl/env/multi_barn_env.py), which then adds the
+  robots one by one with barn_rl_robot.launch.
+
+  Args:
+    world_name  (required) — absolute path to the .world file
+    gui         (default: false)
+    headless    (default: true) — set false when gui is true
+-->
+<launch>
+  <arg name="world_name" />
+  <arg name="gui"      default="false" />
+  <arg name="headless" default="true" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="gui"          value="$(arg gui)" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="headless"     value="$(arg headless)" />
+    <arg name="world_name"   value="$(arg world_name)" />
+  </include>
+</launch>

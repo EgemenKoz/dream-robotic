@@ -1,0 +1,249 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Color: 160; 160; 164
+      Alpha: 0.4
+      Value: true
+    - Class: rviz/RobotModel
+      Name: r0 robot
+      Enabled: true
+      Robot Description: r0/robot_description
+      TF Prefix: r0
+      Visual Enabled: false
+      Collision Enabled: true
+      Alpha: 0.8
+      Update Interval: 0
+      Value: true
+    - Class: rviz/LaserScan
+      Name: r0 scan
+      Enabled: true
+      Topic: /r0/scan
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 239; 41; 41
+      Alpha: 1
+      Decay Time: 0
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Odometry
+      Name: r0 heading
+      Enabled: true
+      Topic: /r0/odom
+      Keep: 1
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Queue Size: 10
+      Covariance:
+        Value: false
+        Position:
+          Value: false
+        Orientation:
+          Value: false
+      Shape:
+        Value: Arrow
+        Color: 239; 41; 41
+        Alpha: 1
+        Shaft Length: 0.6
+        Shaft Radius: 0.05
+        Head Length: 0.2
+        Head Radius: 0.12
+      Value: true
+    - Class: rviz/Path
+      Name: r0 ref path
+      Enabled: true
+      Topic: /r0/rl/ref_path
+      Color: 239; 41; 41
+      Alpha: 1
+      Line Style: Lines
+      Value: true
+    - Class: rviz/RobotModel
+      Name: r1 robot
+      Enabled: true
+      Robot Description: r1/robot_description
+      TF Prefix: r1
+      Visual Enabled: false
+      Collision Enabled: true
+      Alpha: 0.8
+      Update Interval: 0
+      Value: true
+    - Class: rviz/LaserScan
+      Name: r1 scan
+      Enabled: true
+      Topic: /r1/scan
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 52; 101; 164
+      Alpha: 1
+      Decay Time: 0
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Odometry
+      Name: r1 heading
+      Enabled: true
+      Topic: /r1/odom
+      Keep: 1
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Queue Size: 10
+      Covariance:
+        Value: false
+        Position:
+          Value: false
+        Orientation:
+          Value: false
+      Shape:
+        Value: Arrow
+        Color: 52; 101; 164
+        Alpha: 1
+        Shaft Length: 0.6
+        Shaft Radius: 0.05
+        Head Length: 0.2
+        Head Radius: 0.12
+      Value: true
+    - Class: rviz/Path
+      Name: r1 ref path
+      Enabled: false
+      Topic: /r1/rl/ref_path
+      Color: 52; 101; 164
+      Alpha: 1
+      Line Style: Lines
+      Value: false
+    - Class: rviz/RobotModel
+      Name: r2 robot
+      Enabled: true
+      Robot Description: r2/robot_description
+      TF Prefix: r2
+      Visual Enabled: false
+      Collision Enabled: true
+      Alpha: 0.8
+      Update Interval: 0
+      Value: true
+    - Class: rviz/LaserScan
+      Name: r2 scan
+      Enabled: true
+      Topic: /r2/scan
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 78; 154; 6
+      Alpha: 1
+      Decay Time: 0
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Odometry
+      Name: r2 heading
+      Enabled: true
+      Topic: /r2/odom
+      Keep: 1
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Queue Size: 10
+      Covariance:
+        Value: false
+        Position:
+          Value: false
+        Orientation:
+          Value: false
+      Shape:
+        Value: Arrow
+        Color: 78; 154; 6
+        Alpha: 1
+        Shaft Length: 0.6
+        Shaft Radius: 0.05
+        Head Length: 0.2
+        Head Radius: 0.12
+      Value: true
+    - Class: rviz/Path
+      Name: r2 ref path
+      Enabled: false
+      Topic: /r2/rl/ref_path
+      Color: 78; 154; 6
+      Alpha: 1
+      Line Style: Lines
+      Value: false
+    - Class: rviz/RobotModel
+      Name: r3 robot
+      Enabled: true
+      Robot Description: r3/robot_description
+      TF Prefix: r3
+      Visual Enabled: false
+      Collision Enabled: true
+      Alpha: 0.8
+      Update Interval: 0
+      Value: true
+    - Class: rviz/LaserScan
+      Name: r3 scan
+      Enabled: true
+      Topic: /r3/scan
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 245; 121; 0
+      Alpha: 1
+      Decay Time: 0
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Odometry
+      Name: r3 heading
+      Enabled: true
+      Topic: /r3/odom
+      Keep: 1
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Queue Size: 10
+      Covariance:
+        Value: false
+        Position:
+          Value: false
+        Orientation:
+          Value: false
+      Shape:
+        Value: Arrow
+        Color: 245; 121; 0
+        Alpha: 1
+        Shaft Length: 0.6
+        Shaft Radius: 0.05
+        Head Length: 0.2
+        Head Radius: 0.12
+      Value: true
+    - Class: rviz/Path
+      Name: r3 ref path
+      Enabled: false
+      Topic: /r3/rl/ref_path
+      Color: 245; 121; 0
+      Alpha: 1
+      Line Style: Lines
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 30; 30; 34
+    Fixed Frame: r0/odom
+    Frame Rate: 15
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Interact
+  Value: true
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Name: Current View
+      Scale: 45
+      X: -2.25
+      Y: 5
+      Target Frame: <Fixed Frame>
+      Value: TopDownOrtho (rviz)
+Window Geometry:
+  Width: 1200
+  Height: 800

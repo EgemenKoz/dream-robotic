@@ -1,0 +1,25 @@
+<!--
+  Watch a running multi-robot RL training in RViz (read-only).
+
+    roslaunch ~/Desktop/dream/tools/rl_watch.launch
+
+  Attaches to the training's roscore; starts no simulator. Closing RViz ends
+  this launch (rviz is required) and leaves the training untouched.
+
+  Each robot's odom frame is the Gazebo world frame (diff-drive
+  odometrySource defaults to WORLD), so r1..r3/odom are tied to r0/odom with
+  identity transforms to show all four robots in one view.
+-->
+<launch>
+  <param name="use_sim_time" value="true" />
+
+  <node pkg="tf2_ros" type="static_transform_publisher" name="watch_r1_odom"
+        args="0 0 0 0 0 0 r0/odom r1/odom" />
+  <node pkg="tf2_ros" type="static_transform_publisher" name="watch_r2_odom"
+        args="0 0 0 0 0 0 r0/odom r2/odom" />
+  <node pkg="tf2_ros" type="static_transform_publisher" name="watch_r3_odom"
+        args="0 0 0 0 0 0 r0/odom r3/odom" />
+
+  <node pkg="rviz" type="rviz" name="rl_watch_rviz" required="true"
+        args="-d $(dirname)/rl_watch.rviz" />
+</launch>

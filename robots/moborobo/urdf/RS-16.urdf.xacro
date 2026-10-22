@@ -15,12 +15,12 @@
         iyy="0.001094695" iyz="0"
         izz="0.001245079"/>
     </inertial>
-    <visual>
+    <xacro:if value="$(arg visual)"><visual>
       <origin rpy="-1.5707 0 0" xyz="0.005 0 0.53"/>
       <geometry>
         <mesh filename="$(find moborobo)/meshes/robosense_16.dae" scale="0.82 0.82 0.82"/>
       </geometry>
-    </visual>
+    </visual></xacro:if>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0.53"/>
       <geometry>
@@ -58,15 +58,15 @@
               <max_angle>3.14</max_angle>
             </horizontal>
             <vertical>
-              <samples>900</samples>
+              <samples>$(arg lidar_v_samples)</samples>
               <resolution>1</resolution>
-              <min_angle>-2.7</min_angle>
-              <max_angle>2.7</max_angle>
+              <min_angle>$(arg lidar_v_min)</min_angle>
+              <max_angle>$(arg lidar_v_max)</max_angle>
             </vertical>
           </scan>
           <range>
             <min>0.4</min>
-            <max>150.0</max>
+            <max>$(arg lidar_max_range)</max>
             <resolution>0.001</resolution>
           </range>
           <noise>
@@ -76,10 +76,10 @@
           </noise>
         </ray>
         <plugin name="gazebo_ros_laser_controller" filename="libgazebo_ros_robosense_gpu_laser.so">
-          <topicName>/rs_points</topicName>
+          <topicName>rs_points</topicName>
           <frameName>robosense</frameName>
           <min_range>0.4</min_range>
-          <max_range>150.0</max_range>
+          <max_range>$(arg lidar_max_range)</max_range>
           <gaussianNoise>0.008</gaussianNoise>
         </plugin>
       </sensor>

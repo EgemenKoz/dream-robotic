@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<!--
+  barn_rl_robot.launch — Add one training robot to a running Gazebo world.
+
+  Launched once per robot by MultiRobotBarnVecEnv. Everything lives under the
+  robot's namespace, so several can share a world:
+
+    /<ns>/cmd_vel     velocity command (diff-drive plugin)
+    /<ns>/rs_points   RS-16 point cloud
+    /<ns>/scan        2D LaserScan (pointcloud_to_laserscan)
+    TF frames         <ns>/base_link, <ns>/robosense, ...
+
+  The robots are "ghosts" to each other: `collide_bitmask` gives each its own
+  collision bit, so they pass through one another while still hitting the
+  obstacles, and with `visual:=false` they have no rendered geometry, so the
+  gpu_ray lidar of one cannot see another.
+
+  No move_base and no collision publisher: the env drives /<ns>/cmd_vel
+  directly and tests collisions geometrically.
+
+  Args:
+    ns               (required) — namespace and TF prefix, e.g. r0
+    model            (required) — Gazebo model name, e.g. moborobo_0
+    collide_bitmask  (required) — this robot's collision bit, e.g. 1, 2, 4, ...
+    visual           (default: false)
+    lidar_v_samples / lidar_v_min / lidar_v_max / lidar_max_range
+                     vertical sampling of the RS-16 (see RS-16.urdf.xacro)
+-->
+<launch>
+  <arg name="ns" />
+  <arg name="model" />
+  <arg name="collide_bitmask" />
+  <arg name="visual"          default="false" />
+  <arg name="init_x"          default="-2.25" />
+  <arg name="init_y"          default="3.0" />
+  <arg name="init_z"          default="0.2" />
+  <arg name="init_yaw"        default="1.5708" />
+  <arg name="lidar_v_samples" default="900" />
+  <arg name="lidar_v_min"     default="-2.7" />
+  <arg name="lidar_v_max"     default="2.7" />
+  <arg name="lidar_max_range" default="150.0" />
+
+  <group ns="$(arg ns)">
+    <param name="tf_prefix" value="$(arg ns)" />
+    <param name="robot_description"
+           command="$(find xacro)/xacro '$(find moborobo)/description/robot.udrf.xacro'
+                    collide_bitmask:=$(arg collide_bitmask)
+                    visual:=$(arg visual)
+                    camera:=false
+                    lidar_v_samples:=$(arg lidar_v_samples)
+                    lidar_v_min:=$(arg lidar_v_min)
+                    lidar_v_max:=$(arg lidar_v_max)
+                    lidar_max_range:=$(arg lidar_max_range)" />
+
+    <node name="spawn_moborobo" pkg="gazebo_ros" type="spawn_model" output="screen"
+          args="-param robot_description -urdf -model $(arg model)
+                -x $(arg init_x) -y $(arg init_y) -z $(arg init_z)
+                -Y $(arg init_yaw)" />
+
+    <node name="robot_state_publisher" pkg="robot_state_publisher"
+          type="robot_state_publisher" output="screen" />
+
+    <node pkg="pointcloud_to_laserscan" type="pointcloud_to_laserscan_node"
+          name="pointcloud_to_laserscan" output="screen">
+      <remap from="cloud_in" to="rs_points" />
+      <param name="target_frame" value="$(arg ns)/base_link" />
+      <rosparam>
+        transform_tolerance: 0.05
+        min_height: 0.0
+        max_height: 1.0
+
+        angle_min: -3.14159
+        angle_max:  3.14159
+        angle_increment: 0.0087
+        scan_time: 0.1
+        range_min: 0.45
+        range_max: 10.0
+        use_inf: true
+        concurrency_level: 1
+      </rosparam>
+    </node>
+  </group>
+</launch>

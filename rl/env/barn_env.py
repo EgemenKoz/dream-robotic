@@ -2,8 +2,25 @@
 Gymnasium environment wrapping the BARN Gazebo simulation.
 
 Direct velocity control (bypasses move_base).
-  obs  = [scan_ranges (norm 0-1, N rays), dist_to_goal (0-1), angle_to_goal (-1,1)]
-  act  = [linear_x, angular_z]
+
+Two-part Dict observation (structure follows the multi-robot DRL
+collision-avoidance literature — Fan & Long et al. ICRA'18 / IJRR'20):
+  obs["scan"]  : (SCAN_STACK [+1], N) — last K frames, each min-pooled into
+                 N sectors and normalised by SCAN_CLIP_RANGE → [0, 1].
+                 With RLEnvConfig.SCAN_MEMORY on, ranges are fused with an
+                 egocentric point store so sectors inside the LiDAR's 0.45 m
+                 blind ring report their remembered distance instead of
+                 reading as open space, and one extra row is appended marking
+                 which sectors were directly measured this step.
+                 See rl/env/scan_memory.py for why this is necessary.
+  obs["state"] : (5,) — [dist_to_goal_norm (0-1),
+                         sin(angle_to_goal), cos(angle_to_goal),
+                         last_linear_norm (-1,1), last_angular_norm (-1,1)]
+  act  = [linear_x, angular_z]  — linear_x may be negative (reverse), down to
+         -RLEnvConfig.REVERSE_SPEED_RATIO * max_linear.
+
+Episodes end on contact, on reaching the goal, when the robot has stopped
+going anywhere (RLEnvConfig.STUCK_TERMINATION), or on the step limit.
 
 Quick start — Gazebo already running externally:
     env = BarnEnv(robot="moborobo", world_idx=30, managed=False)
@@ -18,21 +35,26 @@ Quick start — env manages Gazebo (launches/kills per world change):
 
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from os.path import join
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
 import rospy
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Path
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from std_msgs.msg import Header
 
 # ── project imports ────────────────────────────────────────────────────────────
 _PROJECT_ROOT = os.path.abspath(join(os.path.dirname(__file__), "../.."))
@@ -44,13 +66,25 @@ from configs.config import (
     RobotConfig, SimConfig, WorldConfig, apply_env,
 )
 from configs.rl_config import RLEnvConfig, RLLogConfig
+from rl.env.geometry import shortcut_path, world_cylinders
 
 # GazeboSimulation lives in the local gazebo/ package inside this project.
 from gazebo.gazebo_simulation import GazeboSimulation
+from rl.env.scan_memory import ScanMemory
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
-_SCAN_WAIT_TIMEOUT = 10.0  # seconds to wait for a scan message after reset
+_SCAN_WAIT_TIMEOUT     = 30.0  # seconds to wait for a scan message after reset
+                                # (moborobo cold-start: gzserver + RoboSense plugin +
+                                # pointcloud_to_laserscan can take 10–20 s the first time)
+_GAZEBO_SVC_TIMEOUT    = 90.0  # seconds to wait for Gazebo services after roslaunch
+_ROSCORE_START_TIMEOUT = 30.0  # seconds to wait for roscore port 11311 to accept
+
+# RViz debug topics (published only while subscribed — see _publish_debug).
+_MEM_CLOUD_TOPIC  = "/rl/scan_memory"
+_FUSED_SCAN_TOPIC = "/rl/fused_scan"
+_REF_PATH_TOPIC   = "/rl/ref_path"
+_DEBUG_Z          = 0.3   # m — draw height of the 2D memory points in base_link
 
 _SCAN_TOPIC = {
     "jackal":   "front/scan",
@@ -86,8 +120,13 @@ class BarnEnv(gym.Env):
         Fixed world index 0-299, or None to randomise each episode.
         When None and managed=True the env restarts Gazebo on every world change.
     num_scan_rays : int
-        Laser scan bins in the observation (scan is resampled to this count).
+        Laser scan sectors per frame (raw scan is min-pooled to this count).
         Moborobo produces ~722 rays after pointcloud_to_laserscan; Jackal ~1080.
+    scan_stack : int
+        Number of consecutive scan frames stacked in obs["scan"].
+    scan_clip_range : float
+        Ranges are clipped to min(scan_clip_range, robot max range) metres
+        before normalising, to keep resolution near obstacles.
     step_duration : float
         Seconds to let physics run per step (sim-time at ~1× real-time factor).
     max_episode_steps : int
@@ -108,8 +147,42 @@ class BarnEnv(gym.Env):
     reward_step : float
         Per-step living penalty (negative, small).
     reward_shaping : bool
-        If True, add (prev_dist − curr_dist) shaping each step so the agent
-        gets a dense signal for moving toward the goal.
+        If True, apply progress / heading / proximity shaping each step.
+    reward_progress_scale : float
+        Multiplier on (prev_dist − curr_dist) shaping.
+    reward_prox_scale : float
+        Scale of the near-obstacle penalty. Quadratic in metres between
+        RLEnvConfig.PROX_RAMP_START_M and PROX_FLOOR_M, weighted by speed.
+    reward_heading_scale : float
+        Scale of the |angle_to_goal|/π heading penalty.
+    scan_memory : bool
+        Keep an egocentric point store so sectors inside the LiDAR's 0.45 m
+        blind ring report their remembered range instead of "clear".
+        Appends one channel to obs["scan"] (see rl/env/scan_memory.py).
+    reverse_speed_ratio : float
+        Reverse speed limit as a fraction of max_linear; the linear action
+        range is [-ratio * max_linear, max_linear].  0 disables reversing.
+    reward_reverse_scale : float
+        Per-step penalty scale while reversing (-scale * |lin| / max_linear).
+    terminal_potential_zero : bool
+        Ablation only (default off): pay +progress_scale * dist on terminal
+        transitions so the progress shaping is potential-based.  See
+        RLEnvConfig.TERMINAL_POTENTIAL_ZERO for why this is not the default.
+    stuck_termination : bool
+        Terminate (a real terminal, not a truncation) when the robot is within
+        `stuck_min_displacement` metres of where it was `stuck_window_steps`
+        steps ago.
+    reward_stuck : float
+        Terminal reward on a stuck termination (negative).
+    ns : str
+        ROS namespace of this robot's topics ("" = the single-robot layout:
+        /cmd_vel, /scan).  Set by MultiRobotBarnVecEnv, which runs several
+        robots in one Gazebo world.
+    model_name : str | None
+        Gazebo model name (default: the robot's standard name).
+    collision_fn : callable | None
+        (x, y, yaw) -> bool.  When given it replaces the /collision topic as
+        the collision test.
     """
 
     metadata = {"render_modes": []}
@@ -119,8 +192,12 @@ class BarnEnv(gym.Env):
         robot: str = "moborobo",
         world_idx: Optional[int] = None,
         num_scan_rays: int = RLEnvConfig.NUM_SCAN_RAYS,
+        scan_stack: int = RLEnvConfig.SCAN_STACK,
+        scan_clip_range: float = RLEnvConfig.SCAN_CLIP_RANGE,
         step_duration: float = RLEnvConfig.STEP_DURATION,
-        max_episode_steps: int = RLEnvConfig.MAX_EPISODE_STEPS,
+        # None → resolved per-robot via RLEnvConfig.max_episode_steps(robot).
+        # Pass an int to override (e.g. for short unit tests).
+        max_episode_steps: Optional[int] = None,
         gui: bool = False,
         managed: bool = True,
         log_dir: Optional[str] = None,
@@ -128,19 +205,43 @@ class BarnEnv(gym.Env):
         reward_goal: float = RLEnvConfig.REWARD_GOAL,
         reward_step: float = RLEnvConfig.REWARD_STEP,
         reward_shaping: bool = RLEnvConfig.REWARD_SHAPING,
+        # None → resolved per-robot via RLEnvConfig.reward_progress_scale(robot).
+        reward_progress_scale: Optional[float] = None,
+        reward_prox_scale: float = RLEnvConfig.REWARD_PROX_SCALE,
+        reward_heading_scale: float = RLEnvConfig.REWARD_HEADING_SCALE,
+        path_follow_shaping: bool = RLEnvConfig.PATH_FOLLOW_SHAPING,
+        reward_path_scale: float = RLEnvConfig.REWARD_PATH_SCALE,
+        path_max_dev: float = RLEnvConfig.PATH_MAX_DEV,
+        scan_memory: bool = RLEnvConfig.SCAN_MEMORY,
+        reverse_speed_ratio: float = RLEnvConfig.REVERSE_SPEED_RATIO,
+        reward_reverse_scale: float = RLEnvConfig.REWARD_REVERSE_SCALE,
+        terminal_potential_zero: bool = RLEnvConfig.TERMINAL_POTENTIAL_ZERO,
+        stuck_termination: bool = RLEnvConfig.STUCK_TERMINATION,
+        stuck_window_steps: int = RLEnvConfig.STUCK_WINDOW_STEPS,
+        stuck_min_displacement: float = RLEnvConfig.STUCK_MIN_DISPLACEMENT_M,
+        reward_stuck: float = RLEnvConfig.REWARD_STUCK,
+        ns: str = "",
+        model_name: Optional[str] = None,
+        collision_fn: Optional[Callable[[float, float, float], bool]] = None,
     ):
         super().__init__()
 
         if robot not in ("jackal", "moborobo"):
             raise ValueError("robot must be 'jackal' or 'moborobo', got '%s'" % robot)
-        if world_idx is not None and not (0 <= world_idx <= 299):
-            raise ValueError("world_idx must be 0-299 or None, got %r" % world_idx)
+        max_world = WorldConfig.world_count() - 1
+        if world_idx is not None and not (0 <= world_idx <= max_world):
+            raise ValueError("world_idx must be 0-%d or None, got %r" % (max_world, world_idx))
 
         self.robot = robot
         self._fixed_world_idx = world_idx
         self.num_scan_rays = num_scan_rays
+        self.scan_stack = scan_stack
         self.step_duration = step_duration
-        self.max_episode_steps = max_episode_steps
+        self.max_episode_steps = (
+            max_episode_steps
+            if max_episode_steps is not None
+            else RLEnvConfig.max_episode_steps(robot)
+        )
         self.gui = gui
         self.managed = managed
 
@@ -148,12 +249,38 @@ class BarnEnv(gym.Env):
         self._r_goal = reward_goal
         self._r_step = reward_step
         self._r_shaping = reward_shaping
+        self._r_progress_scale = (
+            reward_progress_scale
+            if reward_progress_scale is not None
+            else RLEnvConfig.reward_progress_scale(robot)
+        )
+        self._r_prox_scale = reward_prox_scale
+        self._r_heading_scale = reward_heading_scale
+        self._path_follow_shaping = path_follow_shaping
+        self._r_path_scale = reward_path_scale
+        self._path_max_dev = path_max_dev
+        self._scan_memory_on = scan_memory
+        self._r_reverse_scale = reward_reverse_scale
+        self._terminal_potential_zero = terminal_potential_zero
+        self._stuck_termination = stuck_termination
+        self._stuck_window = int(stuck_window_steps)
+        self._stuck_min_disp = float(stuck_min_displacement)
+        self._r_stuck = reward_stuck
+        # Loaded lazily on world change; None disables the path penalty for
+        # this episode (e.g. when path_N.npy is missing).
+        self._ref_path: Optional[np.ndarray] = None
 
-        self._scan_topic = _SCAN_TOPIC[robot]
-        self._model_name = _MODEL_NAME[robot]
+        self._ns = ns.strip("/")
+        self._scan_topic = self._topic(_SCAN_TOPIC[robot])
+        self._model_name = model_name or _MODEL_NAME[robot]
+        self._collision_fn = collision_fn
         self._max_linear = _MAX_LINEAR[robot]
         self._max_angular = _MAX_ANGULAR[robot]
+        self._max_reverse = float(reverse_speed_ratio) * self._max_linear
         self._scan_max_range = _SCAN_MAX_RANGE[robot]
+        # Normalisation range for the scan observation: clip to keep
+        # resolution near obstacles (BARN gaps are < 1 m wide).
+        self._scan_norm_range = min(float(scan_clip_range), self._scan_max_range)
 
         # Fixed start / goal coordinates (same across all 300 static BARN worlds)
         ix, iy, _iyaw = WorldConfig.STATIC_INIT_POSITION
@@ -164,18 +291,31 @@ class BarnEnv(gym.Env):
         self._max_dist = float(math.sqrt((gx - ix) ** 2 + (gy - iy) ** 2))
 
         # ── Gymnasium spaces ───────────────────────────────────────────────────
-        # Observation layout:
-        #   [0 : num_scan_rays]   → normalised scan ranges  [0, 1]
-        #   [num_scan_rays]       → normalised dist to goal [0, 1]
-        #   [num_scan_rays + 1]   → normalised angle to goal [-1, 1]
-        obs_dim = num_scan_rays + 2
-        obs_low = np.zeros(obs_dim, dtype=np.float32)
-        obs_high = np.ones(obs_dim, dtype=np.float32)
-        obs_low[-1] = -1.0   # angle_to_goal lower bound
-        self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
+        # Two-part Dict observation:
+        #   "scan"  : (scan_stack, N) — last K min-pooled scan frames, [0, 1].
+        #             Row 0 is the oldest frame, row K-1 the newest.
+        #   "state" : (5,) — [dist_norm       [0, 1],
+        #                     sin(angle_to_goal_robot_frame)  [-1, 1],
+        #                     cos(angle_to_goal_robot_frame)  [-1, 1],
+        #                     last linear vel / max_linear    [-1, 1],
+        #                     last angular vel / max_angular  [-1, 1]]
+        # sin/cos avoids the discontinuity at ±π that a raw normalised angle has.
+        # When scan memory is on an extra row is appended: a per-sector flag
+        # marking which sectors of the newest frame were directly measured
+        # (1.0) versus recalled from the point store (0.0).  Conv1d treats
+        # rows as channels, so this drops straight into the existing CNN and
+        # lets it tell "far and confirmed" apart from "near but remembered".
+        N = num_scan_rays
+        scan_rows = scan_stack + (1 if scan_memory else 0)
+        state_low  = np.array([0.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+        state_high = np.array([1.0,  1.0,  1.0, 1.0,  1.0], dtype=np.float32)
+        self.observation_space = spaces.Dict({
+            "scan":  spaces.Box(0.0, 1.0, shape=(scan_rows, N), dtype=np.float32),
+            "state": spaces.Box(state_low, state_high, dtype=np.float32),
+        })
 
         self.action_space = spaces.Box(
-            low=np.array([0.0, -self._max_angular], dtype=np.float32),
+            low=np.array([-self._max_reverse, -self._max_angular], dtype=np.float32),
             high=np.array([self._max_linear, self._max_angular], dtype=np.float32),
             dtype=np.float32,
         )
@@ -195,21 +335,59 @@ class BarnEnv(gym.Env):
         self._step_count: int = 0
         self._episode_reward: float = 0.0
         self._prev_dist: float = self._max_dist
+        self._last_action: np.ndarray = np.zeros(2, dtype=np.float32)
         self._current_world_idx: Optional[int] = None
+        # Rolling scan-frame history for obs["scan"]; cleared on reset and
+        # re-seeded with K copies of the first frame of the episode.
+        self._scan_history: deque = deque(maxlen=scan_stack)
+        # (x, y) per step for the stuck check.  window + 1 entries so the
+        # oldest one is exactly `window` steps behind the newest.
+        self._pos_history: deque = deque(maxlen=self._stuck_window + 1)
+        # Per-sector fused range in metres for the newest frame, plus the
+        # "directly measured this step" mask.  Kept unnormalised because the
+        # proximity penalty is specified in metres.
+        self._fused_m: np.ndarray = np.full(num_scan_rays, self._scan_max_range,
+                                            dtype=np.float32)
+        self._fresh_mask: np.ndarray = np.zeros(num_scan_rays, dtype=np.float32)
+        self._scan_mem: Optional[ScanMemory] = (
+            ScanMemory(
+                num_sectors=num_scan_rays,
+                blind_radius=RLEnvConfig.SCAN_BLIND_RADIUS,
+                mem_radius=RLEnvConfig.SCAN_MEM_RADIUS,
+                voxel=RLEnvConfig.SCAN_MEM_VOXEL,
+                max_age_steps=RLEnvConfig.SCAN_MEM_MAX_AGE,
+            )
+            if scan_memory else None
+        )
 
         # ── ROS / Gazebo handles ───────────────────────────────────────────────
+        self._roscore_proc: Optional[subprocess.Popen] = None
         self._gazebo_proc: Optional[subprocess.Popen] = None
         self._nav_proc: Optional[subprocess.Popen] = None
         self._gazebo_sim: Optional[GazeboSimulation] = None
         self._cmd_vel_pub: Optional[rospy.Publisher] = None
+        # Debug topics for RViz (see rl/rviz/rl_debug.rviz).  Only filled
+        # while something subscribes, so training pays nothing otherwise.
+        self._mem_cloud_pub: Optional[rospy.Publisher] = None
+        self._fused_scan_pub: Optional[rospy.Publisher] = None
+        self._ref_path_pub: Optional[rospy.Publisher] = None
 
         self._latest_scan: Optional[np.ndarray] = None
+        self._latest_scan_stamp: float = 0.0   # sim time of the newest scan
         self._scan_angle_min: float = -math.pi
         self._scan_angle_increment: float = 0.0087   # default from barn_move_base.launch
         self._scan_lock = threading.Lock()
 
         self._ros_ready = False
         self._closed = False
+        # Tracked separately from self._gazebo_proc (roslaunch wrapper): when
+        # gzserver itself segfaults mid-init the wrapper may still be alive
+        # for several seconds, during which any rospy ServiceProxy.call() to
+        # /gazebo/* would hang forever.  We use this PID to fail fast instead.
+        self._gzserver_pid: Optional[int] = None
+        # Resolved once; cleared for the rest of the run if Gazebo fails to
+        # come up with it (see _restart_gazebo).
+        self._nvidia_offload: bool = _nvidia_offload_wanted()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Gymnasium API
@@ -222,16 +400,13 @@ class BarnEnv(gym.Env):
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
-
-        self._episode += 1
-        self._step_count = 0
-        self._episode_reward = 0.0
+        self._reset_episode_state()
 
         # Choose world
         if self._fixed_world_idx is not None:
             target_world = self._fixed_world_idx
         else:
-            target_world = int(self.np_random.integers(0, WorldConfig.STATIC_WORLD_COUNT))
+            target_world = int(self.np_random.integers(0, WorldConfig.world_count()))
 
         world_changed = (target_world != self._current_world_idx)
 
@@ -242,7 +417,15 @@ class BarnEnv(gym.Env):
             if not self._ros_ready:
                 self._connect_ros()
 
-        self._current_world_idx = target_world
+        self._set_world(target_world)
+
+        # Fail fast if gzserver died between _restart_gazebo and now —
+        # otherwise the unpause() service call below blocks forever.
+        self._check_gzserver_alive()
+
+        # Unpause physics so sensors tick: every step() ends with pause(), so
+        # without this _wait_for_scan() would block forever on the 2nd reset.
+        self._gazebo_sim.unpause()
 
         # Teleport robot back to start, wait until it arrives
         retries = 0
@@ -262,38 +445,140 @@ class BarnEnv(gym.Env):
         # Invalidate cached scan so we get a fresh reading
         with self._scan_lock:
             self._latest_scan = None
+        if self._episode == 1:
+            print("    [reset] Waiting for first LaserScan on %s..." % self._scan_topic,
+                  flush=True)
         self._wait_for_scan()
+        return self._first_obs()
 
-        obs = self._build_obs()
+    def _reset_episode_state(self):
+        """Clear everything that belongs to the episode that just ended."""
+        self._episode += 1
+        self._step_count = 0
+        self._episode_reward = 0.0
+        self._last_action = np.zeros(2, dtype=np.float32)
+        self._scan_history.clear()
+        self._pos_history.clear()
+        if self._scan_mem is not None:
+            self._scan_mem.reset()
+
+    def _set_world(self, world_idx: int):
+        """Record the active world and load its reference path."""
+        if world_idx != self._current_world_idx or self._ref_path is None:
+            self._ref_path = self._load_ref_path(world_idx)
+        self._current_world_idx = world_idx
+
+    def _first_obs(self) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """Observation and info for the first step of an episode.  The robot
+        must already be at the start pose with a scan taken from there."""
         state = self._gazebo_sim.get_model_state()
-        self._prev_dist = _dist(self._goal_pos, (state.pose.position.x, state.pose.position.y))
+        p, o = state.pose.position, state.pose.orientation
+        obs = self._build_obs((p.x, p.y, _quat_to_yaw(o.x, o.y, o.z, o.w)))
+        self._prev_dist = _dist(self._goal_pos, (p.x, p.y))
+        self._pos_history.append((p.x, p.y))
 
-        return obs, {"world_idx": self._current_world_idx, "episode": self._episode}
+        # NOTE: the key is "episode_idx" (not "episode") to avoid clashing with
+        # SB3's Monitor wrapper, which writes info["episode"] = {"r","l","t"} on
+        # episode termination — see TrainProgressCallback in train_sac.py.
+        return obs, {"world_idx": self._current_world_idx, "episode_idx": self._episode}
 
     def step(
         self, action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        lin = float(action[0])
-        ang = float(action[1])
+        self._apply_action(action)
+        self._advance_sim()
+        return self._finish_step()
 
-        # Run physics for one timestep
+    # step() in three parts, so MultiRobotBarnVecEnv can apply every robot's
+    # action, advance the shared simulation once, then finish every robot.
+
+    def _apply_action(self, action: np.ndarray):
+        """Clip and record the action. Nothing is sent to the robot yet."""
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._last_action[0] = float(action[0])
+        self._last_action[1] = float(action[1])
+
+    def _publish_action(self):
+        self._pub_cmd(float(self._last_action[0]), float(self._last_action[1]))
+
+    def _advance_sim(self):
+        """Run physics for one timestep with the recorded action."""
         self._gazebo_sim.unpause()
-        self._pub_cmd(lin, ang)
+        self._publish_action()
         time.sleep(self.step_duration)
         self._gazebo_sim.pause()
 
-        # Observe
-        obs = self._build_obs()
+    def _finish_step(self) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Observe, score and terminate — everything after the physics ran."""
+        lin = float(self._last_action[0])
+
+        # Observe — one Gazebo service call, shared by the obs and the reward.
         state = self._gazebo_sim.get_model_state()
         pos = state.pose.position
+        ori = state.pose.orientation
+        yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
+        obs = self._build_obs((pos.x, pos.y, yaw))
         curr_dist = _dist(self._goal_pos, (pos.x, pos.y))
-        collided = self._gazebo_sim.get_hard_collision()
+        self._pos_history.append((pos.x, pos.y))
+        if self._collision_fn is not None:
+            collided = bool(self._collision_fn(pos.x, pos.y, yaw))
+        else:
+            collided = self._gazebo_sim.get_hard_collision()
+        # Metres, over the arc around the direction of travel (rear arc when
+        # reversing), fused with the near-field memory — this is the quantity
+        # the proximity penalty is defined against.
+        min_range_m = self._travel_min_m(lin)
 
-        # Reward
-        reward = float(self._r_step)
+        # Reward — track each component so it can be surfaced in info / debug.
+        r_step = float(self._r_step)
+        r_progress = 0.0
+        r_prox = 0.0
+        r_heading = 0.0
+        r_path = 0.0
+        r_reverse = 0.0
+        r_stuck = 0.0
+        r_terminal_phi = 0.0
+        path_dev = 0.0
         if self._r_shaping:
-            reward += self._prev_dist - curr_dist   # positive when moving toward goal
+            # progress: positive when moving toward goal
+            r_progress = self._r_progress_scale * (self._prev_dist - curr_dist)
+
+            # Near-obstacle penalty, in metres: quadratic ramp from
+            # PROX_RAMP_START_M down to PROX_FLOOR_M and weighted by speed
+            # (either direction).  What kills is crossing the last few centimetres of the
+            # blind ring quickly; holding the same distance while barely
+            # moving is not equally bad, and the old flat linear term could
+            # not express that.
+            ramp = RLEnvConfig.PROX_RAMP_START_M
+            floor = RLEnvConfig.PROX_FLOOR_M
+            if min_range_m < ramp:
+                t = float(np.clip((ramp - min_range_m) / max(ramp - floor, 1e-6),
+                                  0.0, 1.0))
+                speed_w = 0.5 + 0.5 * (abs(lin) / self._max_linear)
+                r_prox = -self._r_prox_scale * t * t * speed_w
+
+            # heading penalty: scaled |angle_to_goal|/pi
+            dx = self._goal_pos[0] - pos.x
+            dy = self._goal_pos[1] - pos.y
+            angle_robot = _wrap_angle(math.atan2(dy, dx) - yaw)
+            r_heading = -self._r_heading_scale * (abs(angle_robot) / math.pi)
+
+            # path-following: perpendicular deviation from A* reference polyline.
+            # Path is reward-only — never appears in the observation.
+            if self._path_follow_shaping and self._ref_path is not None:
+                path_dev = _point_to_path_dist(
+                    np.array([pos.x, pos.y], dtype=np.float64),
+                    self._ref_path,
+                )
+                ratio = min(path_dev, self._path_max_dev) / self._path_max_dev
+                r_path = -self._r_path_scale * ratio
+
+            # Reversing: small per-step cost so backing out of a trap stays
+            # cheap but driving the course backwards does not pay.
+            if lin < 0.0:
+                r_reverse = -self._r_reverse_scale * (abs(lin) / self._max_linear)
+
+        reward = r_step + r_progress + r_prox + r_heading + r_path + r_reverse
         self._prev_dist = curr_dist
 
         terminated = truncated = False
@@ -307,22 +592,55 @@ class BarnEnv(gym.Env):
             outcome = "success"
         else:
             self._step_count += 1
-            if self._step_count >= self.max_episode_steps:
+            if self._stuck_termination and _is_stuck(
+                    self._pos_history, self._stuck_window, self._stuck_min_disp):
+                # A real terminal, unlike the time limit below: the critic
+                # gets no bootstrap, so "going nowhere" has a definite value.
+                r_stuck = float(self._r_stuck)
+                reward += r_stuck
+                terminated = True
+                outcome = "stuck"
+            elif self._step_count >= self.max_episode_steps:
                 truncated = True
                 outcome = "timeout"
             else:
                 outcome = "running"
 
+        # Ablation only (off by default, see RLEnvConfig.TERMINAL_POTENTIAL_ZERO):
+        # pay back the potential still sitting in a terminal state so the
+        # progress shaping telescopes to the same constant for every episode.
+        # Never applied on truncation — a time limit is a bootstrap cutoff.
+        if terminated and self._r_shaping and self._terminal_potential_zero:
+            r_terminal_phi = self._r_progress_scale * curr_dist
+            reward += r_terminal_phi
+
         self._episode_reward += reward
 
         info: Dict[str, Any] = {
             "world_idx": self._current_world_idx,
-            "episode": self._episode,
+            "episode_idx": self._episode,
             "step": self._step_count,
             "dist_to_goal": curr_dist,
             "collided": collided,
             "outcome": outcome,
             "episode_reward": self._episode_reward,
+            # Travel-arc clearance in metres and the fraction of sectors that
+            # were directly measured this step.  A low fresh_frac alongside a
+            # small min_range means the memory is carrying the near field —
+            # exactly the situation the old observation reported as "clear".
+            "min_range_m": min_range_m,
+            "fresh_frac": float(np.mean(self._fresh_mask)) if self._fresh_mask.size else 1.0,
+            "reward_components": {
+                "step": r_step,
+                "progress": r_progress,
+                "prox": r_prox,
+                "heading": r_heading,
+                "path": r_path,
+                "path_dev_m": path_dev,
+                "reverse": r_reverse,
+                "stuck": r_stuck,
+                "terminal_phi": r_terminal_phi,
+            },
         }
 
         if terminated or truncated:
@@ -341,12 +659,27 @@ class BarnEnv(gym.Env):
             pass
         if self.managed:
             self._kill_processes()
+            if self._roscore_proc is not None:
+                try:
+                    self._roscore_proc.send_signal(signal.SIGINT)
+                    self._roscore_proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        self._roscore_proc.terminate()
+                    except Exception:
+                        pass
+                self._roscore_proc = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Process management
     # ──────────────────────────────────────────────────────────────────────────
 
     def _restart_gazebo(self, world_idx: int):
+        # Start (or keep) a persistent roscore: roslaunch will reuse it, so
+        # `rospy.init_node` only blocks on the very first call.
+        self._ensure_roscore()
+
+        print("    [setup] Killing previous Gazebo processes...", flush=True)
         self._kill_processes()
         time.sleep(1.0)
 
@@ -358,6 +691,17 @@ class BarnEnv(gym.Env):
         if not os.path.exists(world_file):
             raise FileNotFoundError("World file not found: %s" % world_file)
 
+        log_dir = self._log_dir or os.path.join(_PROJECT_ROOT, "results", "rl", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        gz_log_path  = os.path.join(log_dir, "gazebo_world%d.log" % world_idx)
+        nav_log_path = os.path.join(log_dir, "navstack_world%d.log" % world_idx)
+        gz_log  = open(gz_log_path,  "w")
+        nav_log = open(nav_log_path, "w")
+
+        print("    [setup] Launching Gazebo (world %d)%s... log=%s"
+              % (world_idx, " on NVIDIA" if self._nvidia_offload else "",
+                 gz_log_path), flush=True)
+        gz_env = _gazebo_process_env(self._nvidia_offload)
         if self.robot == "jackal":
             import rospkg
             base = rospkg.RosPack().get_path("jackal_helper")
@@ -368,8 +712,7 @@ class BarnEnv(gym.Env):
                     "world_name:=" + world_file,
                     "gui:=" + ("true" if self.gui else "false"),
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=gz_log, stderr=gz_log, env=gz_env,
             )
         else:
             self._gazebo_proc = subprocess.Popen(
@@ -381,21 +724,101 @@ class BarnEnv(gym.Env):
                     "headless:=" + ("false" if self.gui else "true"),
                     "use_collision_publisher:=true",
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=gz_log, stderr=gz_log, env=gz_env,
             )
             # barn_move_base.launch provides pointcloud_to_laserscan → /scan.
             # move_base idles because we never send it a goal.
             self._nav_proc = subprocess.Popen(
                 ["roslaunch", MoboroboConfig.nav_launch_file()],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=nav_log, stderr=nav_log,
             )
 
-        time.sleep(GazeboConfig.STARTUP_WAIT)
+        # ── Poll for Gazebo services instead of fixed sleep — surfaces a
+        # crashed gzserver fast (and avoids hangs when 5s isn't enough). ───────
+        try:
+            self._wait_for_gazebo(gz_log_path)
+        except (RuntimeError, TimeoutError) as exc:
+            if not self._nvidia_offload:
+                raise
+            # The only thing this run does differently from a stock launch is
+            # the render offload, so drop it and try once more before failing.
+            print("    [setup] Gazebo did not start with NVIDIA offload (%s); "
+                  "retrying on the default GPU." % exc, flush=True)
+            self._nvidia_offload = False
+            return self._restart_gazebo(world_idx)
+
+        # Connect ROS (lazy — only really does work on the first reset).
         self._connect_ros()
+        # The proxies created by GazeboSimulation point at the freshly started
+        # gzserver — must be recreated on every world change.
+        self._gazebo_sim = GazeboSimulation(
+            init_position=list(WorldConfig.STATIC_INIT_POSITION),
+            model_name=self._model_name,
+        )
+
+    def _wait_for_gazebo(self, gz_log_path: str):
+        """Block until Gazebo's services answer and gzserver's PID is known."""
+        print("    [setup] Waiting for Gazebo services...", end="", flush=True)
+        t0 = time.time()
+        while time.time() - t0 < _GAZEBO_SVC_TIMEOUT:
+            if self._gazebo_proc.poll() is not None:
+                print(" CRASHED")
+                raise RuntimeError(
+                    "Gazebo process exited unexpectedly (rc=%d). See %s for details."
+                    % (self._gazebo_proc.returncode, gz_log_path)
+                )
+            try:
+                rospy.wait_for_service("/gazebo/set_model_state", timeout=2.0)
+                rospy.wait_for_service("/gazebo/get_model_state", timeout=2.0)
+                break
+            except rospy.ROSException:
+                print(".", end="", flush=True)
+        else:
+            print(" TIMEOUT")
+            raise TimeoutError(
+                "Gazebo services did not come up within %.0fs. See %s for details."
+                % (_GAZEBO_SVC_TIMEOUT, gz_log_path)
+            )
+        print(" OK (%.1fs)" % (time.time() - t0), flush=True)
+
+        # Find the actual gzserver PID (not the roslaunch wrapper).  Used by
+        # _check_gzserver_alive() to fail fast on a crashed gzserver instead
+        # of hanging in a Gazebo ROS service call.
+        self._gzserver_pid = _find_gzserver_pid()
+        if self._gzserver_pid is None:
+            raise RuntimeError(
+                "gzserver process not found after services came up. "
+                "See %s for the crash." % gz_log_path
+            )
+
+    def _ensure_roscore(self):
+        """Lazy-start a persistent roscore that outlives Gazebo restarts."""
+        if self._roscore_proc is not None and self._roscore_proc.poll() is None:
+            return  # already running
+        import socket
+        log_dir = self._log_dir or os.path.join(_PROJECT_ROOT, "results", "rl", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        rc_log = open(os.path.join(log_dir, "roscore.log"), "w")
+        print("    [roscore] Starting roscore...", end="", flush=True)
+        self._roscore_proc = subprocess.Popen(
+            ["roscore"], stdout=rc_log, stderr=rc_log,
+        )
+        deadline = time.time() + _ROSCORE_START_TIMEOUT
+        while time.time() < deadline:
+            try:
+                s = socket.create_connection(("localhost", 11311), timeout=1.0)
+                s.close()
+                break
+            except (socket.error, socket.timeout):
+                print(".", end="", flush=True)
+                time.sleep(0.5)
+        else:
+            raise TimeoutError("roscore did not start within %.0fs"
+                               % _ROSCORE_START_TIMEOUT)
+        print(" OK", flush=True)
 
     def _kill_processes(self):
+        # Gracefully stop tracked subprocesses (NOT the roscore — keep that).
         for proc in (self._nav_proc, self._gazebo_proc):
             if proc is None:
                 continue
@@ -407,9 +830,18 @@ class BarnEnv(gym.Env):
                 proc.wait()
             except OSError:
                 pass
+        # Pkill any orphan processes — survives roslaunch crashes and dead
+        # python sessions from previous runs.  Roscore is intentionally left
+        # alive (see _ensure_roscore); everything else gets reaped.
+        for pattern in ("gzserver", "gzclient",
+                        "pointcloud_to_laserscan", "move_base",
+                        "roslaunch.*barn_"):
+            subprocess.call(
+                ["pkill", "-SIGKILL", "-f", pattern],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         self._gazebo_proc = None
         self._nav_proc = None
-        self._ros_ready = False
         self._gazebo_sim = None
 
     def _patch_ros_paths(self):
@@ -434,40 +866,79 @@ class BarnEnv(gym.Env):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _connect_ros(self):
-        """Initialise ROS node, publishers, subscribers, and GazeboSimulation."""
-        try:
-            rospy.init_node("barn_rl_env", anonymous=True, disable_signals=True)
-        except rospy.exceptions.ROSException:
-            pass  # already initialised in this process
+        """Initialise ROS node, publishers, subscribers.
+        Idempotent — safe to call after every Gazebo restart."""
+        if not self._ros_ready:
+            try:
+                rospy.init_node("barn_rl_env", anonymous=True, disable_signals=True)
+            except rospy.exceptions.ROSException:
+                pass  # already initialised in this process
 
-        self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-        rospy.Subscriber(
-            self._scan_topic, LaserScan, self._scan_cb, queue_size=1,
-            buff_size=2 ** 20,
-        )
+            self._cmd_vel_pub = rospy.Publisher(
+                self._topic("/cmd_vel"), Twist, queue_size=1)
+            self._mem_cloud_pub = rospy.Publisher(
+                self._topic(_MEM_CLOUD_TOPIC), PointCloud2, queue_size=1)
+            self._fused_scan_pub = rospy.Publisher(
+                self._topic(_FUSED_SCAN_TOPIC), LaserScan, queue_size=1)
+            self._ref_path_pub = rospy.Publisher(
+                self._topic(_REF_PATH_TOPIC), Path, queue_size=1)
+            rospy.Subscriber(
+                self._scan_topic, LaserScan, self._scan_cb, queue_size=1,
+                buff_size=2 ** 20,
+            )
+            self._ros_ready = True
 
-        self._gazebo_sim = GazeboSimulation(
-            init_position=list(WorldConfig.STATIC_INIT_POSITION),
-            model_name=self._model_name,
-        )
-        self._ros_ready = True
+    def _topic(self, name: str) -> str:
+        """`name` under this robot's namespace ("/scan" -> "/r0/scan")."""
+        name = "/" + name.lstrip("/")
+        return ("/" + self._ns + name) if self._ns else name
+
+    def _frame(self, name: str) -> str:
+        """TF frame under this robot's prefix ("base_link" -> "r0/base_link")."""
+        return (self._ns + "/" + name) if self._ns else name
 
     def _scan_cb(self, msg: LaserScan):
         ranges = np.array(msg.ranges, dtype=np.float32)
-        # Replace NaN / Inf (use_inf=true in the launch means inf = max range)
-        ranges = np.where(np.isfinite(ranges), ranges, msg.range_max)
-        ranges = np.clip(ranges, msg.range_min, msg.range_max)
+        # A non-finite ray means "no return", which has two very different
+        # causes: the beam found nothing out to range_max, or it hit something
+        # closer than range_min (0.45 m) and was discarded.  The old code
+        # mapped both to range_max — so an obstacle 6 cm from the bumper read
+        # as 10 m of open space, the single most dangerous reading possible.
+        #
+        # NaN is preserved here so ScanMemory can tell "unknown" from "clear"
+        # and fill the near field from the point store.  Every consumer must
+        # therefore be NaN-aware; get_scan_info() re-sanitises on the way out
+        # for the classical controllers, which expect finite ranges.
+        invalid = (
+            ~np.isfinite(ranges)
+            | (ranges < msg.range_min)
+            | (ranges > msg.range_max)
+        )
+        ranges[invalid] = np.nan
         with self._scan_lock:
             self._latest_scan = ranges
+            self._latest_scan_stamp = msg.header.stamp.to_sec()
             self._scan_angle_min = float(msg.angle_min)
             self._scan_angle_increment = float(msg.angle_increment)
 
-    def _wait_for_scan(self):
+    def _has_scan(self, after_stamp: Optional[float] = None) -> bool:
+        """Is there a scan — and, if `after_stamp` is given, one taken later
+        than that sim time?"""
+        with self._scan_lock:
+            return self._latest_scan is not None and (
+                after_stamp is None or self._latest_scan_stamp > after_stamp)
+
+    def _wait_for_scan(self, after_stamp: Optional[float] = None):
         deadline = time.time() + _SCAN_WAIT_TIMEOUT
+        last_health_check = 0.0
         while time.time() < deadline:
-            with self._scan_lock:
-                if self._latest_scan is not None:
-                    return
+            if self._has_scan(after_stamp):
+                return
+            # Cheap process-liveness check every 1 s so a crashed gzserver
+            # surfaces immediately instead of blocking the whole timeout.
+            if time.time() - last_health_check > 1.0:
+                self._check_gzserver_alive()
+                last_health_check = time.time()
             time.sleep(0.05)
         raise TimeoutError(
             "No LaserScan received on '%s' within %.1f s. "
@@ -476,41 +947,191 @@ class BarnEnv(gym.Env):
             )
         )
 
+    def _check_gzserver_alive(self):
+        """Raise RuntimeError if the tracked gzserver PID is no longer running.
+
+        Catches the case where gzserver segfaults during plugin init: the
+        roslaunch wrapper stays alive for several seconds while killing
+        sibling nodes, and any /gazebo/* ServiceProxy.call() would otherwise
+        hang forever waiting for a reply from a dead process.
+        """
+        pid = self._gzserver_pid
+        if pid is None:
+            return
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            raise RuntimeError(
+                "gzserver (pid=%d) is no longer alive. Likely segfaulted "
+                "during init — check the Gazebo log in the run dir." % pid
+            )
+
     # ──────────────────────────────────────────────────────────────────────────
     # Observation building
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_scan_normalised(self) -> np.ndarray:
+        """Instantaneous scan only — no memory. Kept for tests and ablations."""
         with self._scan_lock:
             raw = self._latest_scan
         if raw is None:
             return np.ones(self.num_scan_rays, dtype=np.float32)
 
-        # Resample to target resolution with linear interpolation
-        if len(raw) != self.num_scan_rays:
-            src_idx = np.linspace(0, len(raw) - 1, self.num_scan_rays)
-            raw = np.interp(src_idx, np.arange(len(raw)), raw).astype(np.float32)
+        # Min-pool into num_scan_rays sectors: unlike linear interpolation,
+        # a thin obstacle hit by a single raw ray can never disappear.
+        # NaN (no return) is treated as max range here; the memory path in
+        # _fuse_scan() is what resolves the near-field ambiguity properly.
+        raw = np.where(np.isfinite(raw), raw, self._scan_max_range)
+        pooled = _min_pool(raw, self.num_scan_rays)
+        return np.clip(pooled / self._scan_norm_range, 0.0, 1.0).astype(np.float32)
 
-        return np.clip(raw / self._scan_max_range, 0.0, 1.0).astype(np.float32)
+    def _fuse_scan(self, x: float, y: float, yaw: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-sector range in metres, fused with the near-field memory.
 
-    def _build_obs(self) -> np.ndarray:
-        scan = self._get_scan_normalised()
+        Returns (fused_metres, fresh_mask). Without memory the fresh mask is
+        all-ones and the fused ranges come straight from the current scan.
+        """
+        with self._scan_lock:
+            raw = self._latest_scan.copy() if self._latest_scan is not None else None
+            ang_min = self._scan_angle_min
+            ang_inc = self._scan_angle_increment
 
-        state = self._gazebo_sim.get_model_state()
-        pos = state.pose.position
-        ori = state.pose.orientation
+        if self._scan_mem is None:
+            if raw is None:
+                return (np.full(self.num_scan_rays, self._scan_max_range, np.float32),
+                        np.ones(self.num_scan_rays, dtype=np.float32))
+            raw = np.where(np.isfinite(raw), raw, self._scan_max_range)
+            pooled = _min_pool(raw, self.num_scan_rays).astype(np.float32)
+            return pooled, np.ones(self.num_scan_rays, dtype=np.float32)
 
-        yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
-        dx = self._goal_pos[0] - pos.x
-        dy = self._goal_pos[1] - pos.y
+        return self._scan_mem.update(
+            x, y, yaw, raw, ang_min, ang_inc, self._scan_max_range,
+        )
+
+    def _build_obs(self, pose: Optional[Tuple[float, float, float]] = None
+                   ) -> Dict[str, np.ndarray]:
+        if pose is None:
+            state = self._gazebo_sim.get_model_state()
+            p, o = state.pose.position, state.pose.orientation
+            pose = (p.x, p.y, _quat_to_yaw(o.x, o.y, o.z, o.w))
+        px, py, yaw = pose
+
+        fused_m, fresh = self._fuse_scan(px, py, yaw)
+        self._fused_m = fused_m
+        self._fresh_mask = fresh
+        self._publish_debug(px, py, yaw)
+        scan = np.clip(fused_m / self._scan_norm_range, 0.0, 1.0).astype(np.float32)
+
+        # Maintain the frame stack: seed with K copies on the first frame of
+        # an episode (history is cleared in reset()), append afterwards.
+        if not self._scan_history:
+            for _ in range(self.scan_stack):
+                self._scan_history.append(scan)
+        else:
+            self._scan_history.append(scan)
+        rows = list(self._scan_history)
+        if self._scan_mem is not None:
+            rows.append(fresh)
+        scan_stack = np.stack(rows).astype(np.float32)
+
+        dx = self._goal_pos[0] - px
+        dy = self._goal_pos[1] - py
         dist = math.sqrt(dx * dx + dy * dy)
         dist_norm = float(np.clip(dist / self._max_dist, 0.0, 1.0))
 
-        angle_world = math.atan2(dy, dx)
-        angle_robot = _wrap_angle(angle_world - yaw)
-        angle_norm = float(np.clip(angle_robot / math.pi, -1.0, 1.0))
+        angle_robot = _wrap_angle(math.atan2(dy, dx) - yaw)
+        sin_a = math.sin(angle_robot)
+        cos_a = math.cos(angle_robot)
 
-        return np.concatenate([scan, [dist_norm, angle_norm]]).astype(np.float32)
+        last_lin_norm = float(np.clip(self._last_action[0] / self._max_linear, -1.0, 1.0))
+        last_ang_norm = float(np.clip(self._last_action[1] / self._max_angular, -1.0, 1.0))
+
+        return {
+            "scan": scan_stack,
+            "state": np.array(
+                [dist_norm, sin_a, cos_a, last_lin_norm, last_ang_norm],
+                dtype=np.float32,
+            ),
+        }
+
+    def _publish_debug(self, x: float, y: float, yaw: float):
+        """Publish the scan memory and the fused sector ranges for RViz.
+
+        /rl/scan_memory : PointCloud2 in base_link, intensity = age in steps
+                          since the point was last measured (0 = seen now).
+        /rl/fused_scan  : LaserScan in base_link, one ray per sector — exactly
+                          the ranges the policy observes, blind ring filled in.
+        /rl/ref_path    : Path in base_link — the A* reference polyline the
+                          path-deviation penalty is measured against.
+        """
+        self._publish_ref_path(x, y, yaw)
+        if self._scan_mem is None or self._mem_cloud_pub is None:
+            return
+        want_cloud = self._mem_cloud_pub.get_num_connections() > 0
+        want_scan = self._fused_scan_pub.get_num_connections() > 0
+        if not (want_cloud or want_scan):
+            return
+        header = Header(stamp=rospy.Time.now(), frame_id=self._frame("base_link"))
+
+        if want_cloud:
+            pts, age = self._scan_mem.snapshot()
+            # World → base_link so the cloud needs no odom/world TF.
+            dx, dy = pts[:, 0] - x, pts[:, 1] - y
+            c, s = math.cos(yaw), math.sin(yaw)
+            bx = c * dx + s * dy
+            by = -s * dx + c * dy
+            bz = np.full(len(pts), _DEBUG_Z)
+            fields = [
+                PointField("x", 0, PointField.FLOAT32, 1),
+                PointField("y", 4, PointField.FLOAT32, 1),
+                PointField("z", 8, PointField.FLOAT32, 1),
+                PointField("intensity", 12, PointField.FLOAT32, 1),
+            ]
+            rows = np.stack([bx, by, bz, age], axis=1).astype(np.float32)
+            self._mem_cloud_pub.publish(
+                point_cloud2.create_cloud(header, fields, rows.tolist()))
+
+        if want_scan:
+            centres = self._scan_mem.sector_centres()
+            msg = LaserScan()
+            msg.header = header
+            msg.angle_min = float(centres[0])
+            msg.angle_increment = float(centres[1] - centres[0]) if len(centres) > 1 else 0.0
+            msg.angle_max = float(centres[-1])
+            msg.range_min = 0.0
+            msg.range_max = float(self._scan_max_range)
+            msg.ranges = self._fused_m.astype(float).tolist()
+            # 1 = measured this step, 0 = filled in from memory.
+            msg.intensities = self._fresh_mask.astype(float).tolist()
+            self._fused_scan_pub.publish(msg)
+
+    def _publish_ref_path(self, x: float, y: float, yaw: float):
+        if (self._ref_path is None or self._ref_path_pub is None
+                or self._ref_path_pub.get_num_connections() == 0):
+            return
+        header = Header(stamp=rospy.Time.now(), frame_id=self._frame("base_link"))
+        # World → base_link so the path needs no odom/world TF.
+        dx = self._ref_path[:, 0] - x
+        dy = self._ref_path[:, 1] - y
+        c, s = math.cos(yaw), math.sin(yaw)
+        msg = Path(header=header)
+        for bx, by in zip(c * dx + s * dy, -s * dx + c * dy):
+            ps = PoseStamped(header=header)
+            ps.pose.position.x = float(bx)
+            ps.pose.position.y = float(by)
+            ps.pose.position.z = _DEBUG_Z
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+        self._ref_path_pub.publish(msg)
+
+    def _travel_min_m(self, lin: float = 0.0) -> float:
+        """Closest fused range in metres within the arc around the direction
+        of travel — forward, or rearward when `lin` < 0."""
+        if self._scan_mem is not None:
+            centre = math.pi if lin < 0.0 else 0.0
+            return self._scan_mem.arc_min(self._fused_m, RLEnvConfig.PROX_ARC,
+                                          centre=centre)
+        return float(np.min(self._fused_m)) if self._fused_m.size else float("inf")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -540,6 +1161,12 @@ class BarnEnv(gym.Env):
         """
         with self._scan_lock:
             ranges = self._latest_scan.copy() if self._latest_scan is not None else None
+        if ranges is not None:
+            # _scan_cb stores NaN for "no return" so ScanMemory can distinguish
+            # a near-field dropout from open space.  MPPI / DWA expect finite
+            # ranges, so collapse both cases to max range for them — they run
+            # their own costmaps and never see the blind ring anyway.
+            ranges = np.where(np.isfinite(ranges), ranges, self._scan_max_range)
         return ranges, self._scan_angle_min, self._scan_angle_increment, self._scan_max_range
 
     def get_pose(self) -> Tuple[float, float, float]:
@@ -566,6 +1193,37 @@ class BarnEnv(gym.Env):
         msg.angular.z = angular
         self._cmd_vel_pub.publish(msg)
 
+    def _load_ref_path(self, world_idx: int) -> Optional[np.ndarray]:
+        """Load the A* reference polyline for path-following shaping.
+
+        Mirrors benchmark/benchmark_env.py: grid coordinates → Gazebo frame,
+        with the static start prepended and the goal appended, then (with
+        PATH_SMOOTHING) shortened by string pulling against the world's
+        cylinders. Returns None when no path file exists for this world
+        (penalty is then disabled).
+        """
+        pf = WorldConfig.path_file(world_idx)
+        if not os.path.exists(pf):
+            return None
+        try:
+            grid_pts = np.load(pf)
+        except Exception:
+            return None
+        pts = [np.array(self._init_pos, dtype=np.float64)]
+        for gp in grid_pts:
+            pts.append(np.array(
+                WorldConfig.grid_to_gazebo(int(gp[0]), int(gp[1])),
+                dtype=np.float64,
+            ))
+        pts.append(np.array(self._goal_pos, dtype=np.float64))
+        path = np.array(pts, dtype=np.float64)
+        if RLEnvConfig.PATH_SMOOTHING:
+            world_file = WorldConfig.world_file(world_idx)
+            if os.path.exists(world_file):
+                path = shortcut_path(path, world_cylinders(world_file),
+                                     WorldConfig.OBSTACLE_RADIUS)
+        return path
+
     def _log_episode(self, outcome: str, final_dist: float):
         if not self._log_dir:
             return
@@ -586,6 +1244,37 @@ class BarnEnv(gym.Env):
 
 # ── Pure math helpers (also importable for unit tests) ────────────────────────
 
+def _min_pool(ranges: np.ndarray, n: int) -> np.ndarray:
+    """Downsample `ranges` (M,) to (n,) by taking the minimum per sector.
+
+    When M < n (rare — coarse sensor), fall back to linear interpolation
+    since there is nothing to pool.
+    """
+    ranges = np.asarray(ranges, dtype=np.float32)
+    m = len(ranges)
+    if m == n:
+        return ranges.copy()
+    if m < n:
+        src_idx = np.linspace(0, m - 1, n)
+        return np.interp(src_idx, np.arange(m), ranges).astype(np.float32)
+    # M > n: sector edges are strictly increasing because the step m/n > 1.
+    edges = np.linspace(0, m, n + 1).astype(np.int64)
+    return np.minimum.reduceat(ranges, edges[:-1]).astype(np.float32)
+
+
+def _is_stuck(history, window: int, min_disp: float) -> bool:
+    """True when the newest (x, y) in `history` is within `min_disp` metres of
+    the one `window` steps before it.
+
+    Net displacement, not path length or progress toward the goal: dithering
+    back and forth counts as stuck, a sideways detour does not.  False until
+    `window` steps of history exist.
+    """
+    if window <= 0 or len(history) <= window:
+        return False
+    return _dist(history[-1], history[-1 - window]) < min_disp
+
+
 def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
@@ -594,6 +1283,81 @@ def _quat_to_yaw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _nvidia_offload_wanted() -> bool:
+    """Resolve GazeboConfig.NVIDIA_OFFLOAD ("auto" / True / False)."""
+    want = GazeboConfig.NVIDIA_OFFLOAD
+    if want != "auto":
+        return bool(want)
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return subprocess.call(
+            ["nvidia-smi", "-L"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10,
+        ) == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _gazebo_process_env(nvidia_offload: bool) -> Dict[str, str]:
+    """Environment for the Gazebo roslaunch process.
+
+    PRIME render offload sends this process's OpenGL (the gpu_ray lidar) to
+    the NVIDIA GPU while the desktop stays on the integrated one.
+    """
+    env = dict(os.environ)
+    if nvidia_offload:
+        env["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+        env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    return env
+
+
+def _find_gzserver_pid() -> Optional[int]:
+    """Return the PID of the currently running gzserver binary, or None.
+
+    There are usually two PIDs after `roslaunch gazebo_ros`: a /bin/sh
+    wrapper and the real gzserver process; we prefer the latter.
+    """
+    # Match by process *name* (comm), not full command line, so we don't
+    # false-match shell invocations whose argv happens to contain "gzserver".
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-x", "gzserver"],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+    except subprocess.CalledProcessError:
+        return None
+    pids = [int(p) for p in out.split() if p.strip().isdigit()]
+    if not pids:
+        return None
+    # When multiple matches exist, prefer the highest PID (started last).
+    return max(pids)
+
+
+def _point_to_path_dist(pt: np.ndarray, path: np.ndarray) -> float:
+    """Minimum perpendicular distance from pt (2,) to polyline path (N, 2).
+
+    Duplicated from benchmark/metrics.py to avoid a benchmark→rl import cycle.
+    """
+    if path is None or len(path) == 0:
+        return 0.0
+    if len(path) == 1:
+        return float(np.linalg.norm(pt - path[0]))
+    min_d = float("inf")
+    for i in range(len(path) - 1):
+        a, b = path[i], path[i + 1]
+        ab = b - a
+        ab2 = float(np.dot(ab, ab))
+        if ab2 < 1e-12:
+            d = float(np.linalg.norm(pt - a))
+        else:
+            t = float(np.clip(np.dot(pt - a, ab) / ab2, 0.0, 1.0))
+            d = float(np.linalg.norm(pt - a - t * ab))
+        if d < min_d:
+            min_d = d
+    return min_d
 
 
 def _wrap_angle(angle: float) -> float:
