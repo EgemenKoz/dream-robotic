@@ -232,10 +232,10 @@ def main():
                         help="Gradient epochs over each rollout (default: 10)")
     parser.add_argument("--lr",         type=float, default=3e-4)
     parser.add_argument(
-        "--gamma", type=float, default=0.999,
-        help="Discount factor (default: 0.999). At 10 Hz, 0.99 only looks "
-             "100 steps = 2 m ahead, which makes the goal invisible and the "
-             "policy freeze in place; see train_sac.py for the full note.",
+        "--gamma", type=float, default=0.99,
+        help="Discount factor (default: 0.99). The progress reward is dense "
+             "and real, so the goal need not be within the discount horizon; "
+             "see train_sac.py for the full note.",
     )
     parser.add_argument("--gae-lambda", type=float, default=0.95,
                         help="GAE λ — trades off bias vs variance in advantage "

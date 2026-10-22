@@ -74,6 +74,9 @@ class RobotConfig:
         [ 0.21, -0.165],
     ]
 
+    # (length, width) of the chassis in metres, for planar collision tests.
+    COLLISION_BOX = (0.42, 0.33)
+
 
 # ── Moborobo Robot ─────────────────────────────────────────────────────────────
 
@@ -107,6 +110,12 @@ class MoboroboConfig:
         [-0.387, -0.235],
         [-0.387,  0.235],
     ]
+
+    # Gazebo collision box of the chassis, (length, width) in metres, centred
+    # on base_link (robot_core.xacro).  Wheels, casters and the lidar all sit
+    # inside it, so it is the whole ground-plane outline for collision tests.
+    # Shorter than FOOTPRINT above, which is the costmap's padded outline.
+    COLLISION_BOX = (0.70, 0.47)
 
     # Gazebo model name (must match -model arg in barn_gazebo.launch)
     MODEL_NAME = "moborobo"
@@ -192,20 +201,26 @@ class WorldConfig:
         base = Paths.MOBOROBO_NORM_METRICS_FILES if WorldConfig._is_moborobo() else Paths.NORM_METRICS_FILES
         return join(base, "norm_metrics_%d.npy" % world_idx)
 
+    # Gazebo position of grid cell (0, 0).  BARN's own path_coord_to_gazebo_coord
+    # uses (-4.575, 5.075), which is one cell short in x and 0.1 m short in y:
+    # fitting the occupied cells of grid_files/ to the cylinders in the .world
+    # files gives exactly (-4.425, 5.175), with zero residual, for both the
+    # Jackal and the Moborobo datasets.  The old offset put every reference
+    # path 0.15 m / 0.10 m off its true place, 8-15 cm closer to the obstacles.
+    GRID_ORIGIN = (-4.425, 5.175)
+
     @staticmethod
     def grid_to_gazebo(grid_x: int, grid_y: int):
         """Convert BARN dataset 30×30 grid coordinates to Gazebo world coordinates."""
-        RADIUS = 0.075
-        r_shift = -RADIUS - (30 * RADIUS * 2)   # -4.575
-        c_shift = RADIUS + 5                      #  5.075
-        return grid_x * (RADIUS * 2) + r_shift, grid_y * (RADIUS * 2) + c_shift
+        cell = 2 * WorldConfig.OBSTACLE_RADIUS
+        x0, y0 = WorldConfig.GRID_ORIGIN
+        return grid_x * cell + x0, grid_y * cell + y0
 
     @staticmethod
     def gazebo_to_grid_row(gz_x: float) -> int:
         """Inverse of grid_to_gazebo for the X axis (row index)."""
-        RADIUS = 0.075
-        r_shift = -RADIUS - (30 * RADIUS * 2)
-        return int(round((gz_x - r_shift) / (2 * RADIUS)))
+        cell = 2 * WorldConfig.OBSTACLE_RADIUS
+        return int(round((gz_x - WorldConfig.GRID_ORIGIN[0]) / cell))
 
 
 # ── Gazebo Simulation ──────────────────────────────────────────────────────────
@@ -218,6 +233,15 @@ class GazeboConfig:
 
     # Physics
     USE_SIM_TIME     = True            # ROS uses Gazebo clock (always True in sim)
+
+    # Render Gazebo's sensors on the NVIDIA GPU.  On a hybrid laptop in
+    # `prime-select on-demand` mode everything renders on the integrated GPU
+    # unless asked otherwise, and the RS-16 `gpu_ray` sensor is the simulation
+    # bottleneck.  Works per-process through PRIME render offload — no system
+    # setting is touched.
+    #   "auto" — on when `nvidia-smi` works, off otherwise
+    #   True / False — force
+    NVIDIA_OFFLOAD   = "auto"
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────

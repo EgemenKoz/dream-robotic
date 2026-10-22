@@ -2,11 +2,11 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
     <link name="base_link">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <mesh filename="package://moborobo/meshes/moborobo_short.stl" scale="1 1 1"/>
             </geometry>
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <box size=".70 .470 .3"/>
@@ -23,14 +23,14 @@
 
 
     <link name="front_caster_1">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
             </geometry>
             <material name="green">
                 <color rgba="0.0 0.1 0.0 1"/>   
             </material>
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
@@ -50,7 +50,7 @@
     </joint>
 
     <link name="front_wheel_1">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
             </geometry>
@@ -58,7 +58,7 @@
                 
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
@@ -81,14 +81,14 @@
 
 
     <link name="front_caster_2">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
             </geometry>
             <material name="green">
                 <color rgba="0.0 0.1 0.0 1"/>   
             </material>
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
@@ -107,7 +107,7 @@
     </joint>
 
     <link name="front_wheel_2">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
             </geometry>
@@ -115,7 +115,7 @@
                 
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
@@ -137,14 +137,14 @@
 
 
     <link name="back_caster_1">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
             </geometry>
             <material name="green">
                 <color rgba="0.0 0.1 0.0 1"/>   
             </material>
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
@@ -163,7 +163,7 @@
     </joint>
 
     <link name="back_wheel_1">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
             </geometry>
@@ -171,7 +171,7 @@
                 
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
@@ -194,14 +194,14 @@
 
 
     <link name="back_caster_2">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
             </geometry>
             <material name="green">
                 <color rgba="0.0 0.1 0.0 1"/>   
             </material>
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <box size="0.05 0.05 0.05"/>
@@ -220,7 +220,7 @@
     </joint>
 
     <link name="back_wheel_2">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
             </geometry>
@@ -228,7 +228,7 @@
                 
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.04" length="0.0228"/>
@@ -250,7 +250,7 @@
 
 
 <link name="right_wheel">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.1" length="0.04"/>
             </geometry>
@@ -258,7 +258,7 @@
                 <color rgba="0.0 0.0 0.0 1"/>
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.1" length="0.04"/>
@@ -277,7 +277,7 @@
         
     </joint>
     <link name="left_wheel">
-        <visual>
+        <xacro:if value="$(arg visual)"><visual>
             <geometry>
                 <cylinder radius="0.1" length="0.04"/>
             </geometry>
@@ -285,7 +285,7 @@
                 <color rgba="0.0 0.0 0.0 1"/>
             </material>
 
-        </visual>
+        </visual></xacro:if>
         <collision>
             <geometry>
                 <cylinder radius="0.1" length="0.04"/>

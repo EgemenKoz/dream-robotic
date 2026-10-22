@@ -117,6 +117,13 @@ class TestActionSpace:
         env = _make_env()
         assert env.action_space.low[0] < 0.0
 
+    def test_untrained_policy_drives_forward(self):
+        # SAC's tanh output of 0 lands on the middle of the range. A symmetric
+        # range puts that at 0 m/s and a noisy policy dithers in place.
+        env = _make_env()
+        mid = 0.5 * (env.action_space.low[0] + env.action_space.high[0])
+        assert mid > 0.25 * env.action_space.high[0]
+
     def test_reverse_ratio_zero_is_forward_only(self):
         env = _make_env(reverse_speed_ratio=0.0)
         assert env.action_space.low[0] == pytest.approx(0.0)
@@ -514,7 +521,7 @@ class TestScanMemory:
 # Reverse driving + reward wiring
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestRewardConfig:
+class TestRewardDesign:
     def test_reverse_params_stored(self):
         env = _make_env(reverse_speed_ratio=0.25, reward_reverse_scale=0.1)
         assert env._max_reverse == pytest.approx(0.25 * env._max_linear)
@@ -539,35 +546,44 @@ class TestRewardConfig:
         assert _make_env(terminal_potential_zero=False)._terminal_potential_zero is False
         assert _make_env(terminal_potential_zero=True)._terminal_potential_zero is True
 
-    def test_total_shaping_is_independent_of_where_the_episode_ends(self):
-        # THE property that makes progress shaping policy-invariant (Ng et al.
-        # 1999): with Phi(terminal) = 0 the shaping telescopes to the constant
-        # +scale * d_0 no matter how the episode ends, so it cannot rank
-        # outcomes on its own — only the base rewards do that.
-        #
-        # Getting the correction's sign wrong silently breaks this: subtracting
-        # the terminal potential instead of adding it leaves
-        # scale*(d_0 - 2*d_T), which punishes failing early far harder than
-        # failing late and taught the policy to stop dead mid-course.
+    def test_terminal_potential_is_off_by_default(self):
+        # With it on, the progress shaping telescopes to the same constant for
+        # every episode, so progress stops being an incentive and the goal has
+        # to carry the whole signal from 500+ steps away. That needs gamma -> 1
+        # and the critic does not survive it (Q drifted to +716 against a
+        # physical maximum of 225 in the reverse_v1 run).
+        from configs.rl_config import RLEnvConfig as C
+        assert C.TERMINAL_POTENTIAL_ZERO is False
+        assert _make_env()._terminal_potential_zero is False
+
+    def test_progress_ranks_a_late_failure_above_an_early_one(self):
+        # The consequence of the flag being off: progress banked before a
+        # failure is kept, so getting further is worth more.
         from configs.rl_config import RLEnvConfig as C
         scale = C.reward_progress_scale("moborobo")
         d0 = 10.0
 
-        def total_shaping(d_end):
-            banked = scale * (d0 - d_end)          # summed per-step progress
-            correction = scale * d_end             # zeroing Phi at the terminal
-            return banked + correction
+        def banked(d_end):
+            return scale * (d0 - d_end)
 
-        totals = [total_shaping(d) for d in (0.0, 1.0, 3.0, 6.05, 9.5)]
-        assert all(t == pytest.approx(scale * d0) for t in totals), totals
+        assert banked(2.0) > banked(8.0) > banked(9.5) > 0.0
 
-    def test_outcome_ranking_is_set_by_base_rewards_alone(self):
-        # Follows from the invariant above: once shaping contributes the same
-        # constant everywhere, success > timeout > collision has to come from
-        # the terminal rewards.
+    def test_outcome_ranking(self):
+        # Giving up must not pay better than trying: with stuck at half a
+        # collision, multi_v3 learned to dither in front of obstacles until
+        # the stuck check ended the episode.
         from configs.rl_config import RLEnvConfig as C
-        assert C.REWARD_GOAL > 0.0
-        assert 0.0 > C.REWARD_COLLISION
+        assert C.REWARD_GOAL > 0.0 > C.REWARD_STUCK
+        assert C.REWARD_STUCK <= C.REWARD_COLLISION
+
+    def test_driving_forward_beats_standing_still(self):
+        # Full-speed progress has to outweigh every dense penalty at its
+        # worst, or the cheapest policy is to not move.
+        from configs.rl_config import RLEnvConfig as C
+        progress = C.reward_progress_scale("moborobo") * 0.2 * C.STEP_DURATION
+        worst = (-C.REWARD_STEP + C.REWARD_PROX_SCALE + C.REWARD_HEADING_SCALE
+                 + C.REWARD_PATH_SCALE * 0.449 / C.PATH_MAX_DEV)
+        assert progress > worst, (progress, worst)
 
     def test_path_penalty_keeps_a_gradient_at_the_observed_deviation(self):
         # A clipped penalty has zero derivative, so once the robot is past
@@ -581,24 +597,16 @@ class TestRewardConfig:
         )
 
     @pytest.mark.parametrize("script", ["train_sac.py", "train_ppo.py"])
-    def test_discount_horizon_covers_the_course(self, script):
-        # At 10 Hz an effective horizon of 1/(1-gamma) steps must reach the
-        # goal, or the goal reward is discounted into irrelevance and the
-        # policy optimises dense shaping alone — which is what made it freeze
-        # mid-course. Read the default out of the source rather than importing
-        # the trainer (which would pull in SB3 and ROS).
+    def test_discount_leaves_the_critic_a_contraction(self, script):
+        # A target of r + gamma*Q contracts by (1 - gamma) per backup. At
+        # 0.999 that was too weak to hold the Q level in place once the buffer
+        # ran out of terminals. Read the default out of the source rather than
+        # importing the trainer (which would pull in SB3 and ROS).
         import re
-        from configs.rl_config import RLEnvConfig as C
         src = open(os.path.join(_ROOT, script)).read()
         m = re.search(r'"--gamma".*?default=([0-9.]+)', src, re.S)
         assert m, "could not find the --gamma default in %s" % script
-        gamma = float(m.group(1))
-        horizon = 1.0 / (1.0 - gamma)
-        assert horizon >= 0.9 * C.max_episode_steps("moborobo"), (
-            "%s gamma=%.4f gives a %.0f-step horizon, shorter than the "
-            "%d-step episode" % (script, gamma, horizon,
-                                 C.max_episode_steps("moborobo"))
-        )
+        assert float(m.group(1)) <= 0.995
 
     def test_prox_penalty_is_comparable_to_progress_at_the_floor(self):
         # It used to peak at -0.0275/step against +0.25/step of progress, a
@@ -615,6 +623,425 @@ class TestRewardConfig:
         dev = 0.40
         pen = C.REWARD_PATH_SCALE * min(dev, C.PATH_MAX_DEV) / C.PATH_MAX_DEV
         assert pen > 0.05
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stuck termination
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestStuck:
+    WINDOW = 200
+    MIN_DISP = 0.3
+
+    def _stuck(self, history):
+        from rl.env.barn_env import _is_stuck
+        return _is_stuck(history, self.WINDOW, self.MIN_DISP)
+
+    def test_not_stuck_before_the_window_fills(self):
+        assert not self._stuck([(0.0, 0.0)] * self.WINDOW)
+
+    def test_standing_still_is_stuck(self):
+        assert self._stuck([(1.0, 2.0)] * (self.WINDOW + 1))
+
+    def test_dithering_is_stuck(self):
+        # Forward and back 2 cm a step: lots of path length, no displacement.
+        hist = [(0.0, 0.02 * (i % 2)) for i in range(self.WINDOW + 1)]
+        assert self._stuck(hist)
+
+    def test_slow_steady_driving_is_not_stuck(self):
+        # 0.02 m/s — a tenth of full speed — covers 0.4 m in the window.
+        hist = [(0.0, 0.002 * i) for i in range(self.WINDOW + 1)]
+        assert not self._stuck(hist)
+
+    def test_sideways_detour_is_not_stuck(self):
+        # No progress toward a goal straight ahead (+y), but it is moving.
+        hist = [(0.01 * i, 0.0) for i in range(self.WINDOW + 1)]
+        assert not self._stuck(hist)
+
+    def test_only_the_last_window_counts(self):
+        # Drove 5 m, then stopped for a full window.
+        hist = [(0.0, 0.02 * i) for i in range(250)] + [(0.0, 5.0)] * (self.WINDOW + 1)
+        assert self._stuck(hist)
+
+    def test_env_history_spans_exactly_the_window(self):
+        env = _make_env(stuck_window_steps=50)
+        assert env._pos_history.maxlen == 51
+
+    def test_zero_window_never_trips(self):
+        from rl.env.barn_env import _is_stuck
+        assert not _is_stuck([(0.0, 0.0)] * 10, 0, 0.3)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Planar collision geometry (used by the multi-robot env)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestGridTransform:
+    """grid_to_gazebo must put the dataset's occupied cells on its cylinders."""
+
+    @pytest.mark.parametrize("robot", ["jackal", "moborobo"])
+    def test_occupied_cells_land_on_cylinders(self, robot):
+        from configs.config import SimConfig, WorldConfig as W
+        from rl.env.geometry import world_cylinders
+        old = SimConfig.ROBOT
+        SimConfig.ROBOT = robot
+        try:
+            world, grid = W.world_file(0), W.grid_file(0)
+            if not (os.path.exists(world) and os.path.exists(grid)):
+                pytest.skip("%s dataset not available" % robot)
+            centres = world_cylinders(world)
+            cells = np.argwhere(np.load(grid) > 0)
+        finally:
+            SimConfig.ROBOT = old
+        gz = np.array([W.grid_to_gazebo(int(r), int(c)) for r, c in cells])
+        err = np.min(np.hypot(gz[:, None, 0] - centres[None, :, 0],
+                              gz[:, None, 1] - centres[None, :, 1]), axis=1)
+        # A handful of cells in some worlds have no cylinder at all; the
+        # transform itself has to be exact for the rest.
+        assert np.mean(err < 1e-3) > 0.95
+
+    def test_round_trip_row(self):
+        from configs.config import WorldConfig as W
+        for row in (0, 7, 29):
+            assert W.gazebo_to_grid_row(W.grid_to_gazebo(row, 3)[0]) == row
+
+
+class TestShortcutPath:
+    R = 0.075
+
+    def _shortcut(self, path, centres):
+        from rl.env.geometry import shortcut_path
+        return shortcut_path(np.array(path, float), np.array(centres, float).reshape(-1, 2), self.R)
+
+    def test_staircase_in_open_space_becomes_one_segment(self):
+        stairs = [(0, 0), (0.15, 0), (0.15, 0.15), (0.3, 0.15), (0.3, 0.3), (0.45, 0.3)]
+        out = self._shortcut(stairs, [(5.0, 5.0)])
+        assert out.tolist() == [[0, 0], [0.45, 0.3]]
+
+    def test_endpoints_are_kept(self):
+        path = [(0, 0), (1, 0), (1, 1), (2, 1)]
+        out = self._shortcut(path, [(0.5, 0.5)])
+        assert out[0].tolist() == [0, 0] and out[-1].tolist() == [2, 1]
+
+    def test_never_cuts_a_corner_tighter_than_the_original(self):
+        from rl.env.geometry import segment_clearance
+        # Detour around a cylinder at (1, 0.5): the chord (0,0)-(2,0) would
+        # pass 0.425 m from its edge, the detour keeps 0.5 m or more.
+        cyl = [(1.0, 0.0)]
+        path = [(0, 0), (0, 1.0), (2, 1.0), (2, 0)]
+        out = self._shortcut(path, cyl)
+        orig = min(segment_clearance(path[k], path[k + 1], cyl, self.R) for k in range(3))
+        new = min(segment_clearance(out[k], out[k + 1], cyl, self.R) for k in range(len(out) - 1))
+        assert new >= orig - 1e-9
+
+    def test_segment_clearance(self):
+        from rl.env.geometry import segment_clearance
+        # Circle centre 1 m off the middle of the segment.
+        assert segment_clearance((0, 0), (2, 0), [(1, 1)], self.R) == pytest.approx(1 - self.R)
+        # Beyond the end: distance to the endpoint.
+        assert segment_clearance((0, 0), (2, 0), [(3, 0)], self.R) == pytest.approx(1 - self.R)
+
+
+class TestBoxCircle:
+    HL, HW, R = 0.35, 0.235, 0.075      # moborobo chassis, BARN cylinder
+
+    def _gap(self, x, y, yaw, centres):
+        from rl.env.geometry import box_circle_clearance
+        return box_circle_clearance(x, y, yaw, np.array(centres), self.HL, self.HW, self.R)
+
+    def test_no_circles_is_infinitely_clear(self):
+        assert self._gap(0, 0, 0, np.zeros((0, 2))) == float("inf")
+
+    def test_gap_ahead(self):
+        # Cylinder 1 m ahead on the axis: 1.0 - 0.35 (nose) - 0.075 (radius).
+        assert self._gap(0, 0, 0, [[1.0, 0.0]]) == pytest.approx(0.575)
+
+    def test_gap_to_the_side_uses_the_width(self):
+        assert self._gap(0, 0, 0, [[0.0, 1.0]]) == pytest.approx(1.0 - 0.235 - 0.075)
+
+    def test_corner_distance_is_euclidean(self):
+        # 0.3 past the front and 0.4 past the side of the front-left corner.
+        gap = self._gap(0, 0, 0, [[0.35 + 0.3, 0.235 + 0.4]])
+        assert gap == pytest.approx(0.5 - 0.075)
+
+    def test_rotation_swaps_length_and_width(self):
+        # Facing +y, the long axis points at the cylinder.
+        assert self._gap(0, 0, math.pi / 2, [[0.0, 1.0]]) == pytest.approx(0.575)
+        assert self._gap(0, 0, math.pi / 2, [[1.0, 0.0]]) == pytest.approx(1.0 - 0.235 - 0.075)
+
+    def test_translation(self):
+        assert self._gap(-2.25, 3.0, 0, [[-1.25, 3.0]]) == pytest.approx(0.575)
+
+    def test_overlap_is_negative(self):
+        assert self._gap(0, 0, 0, [[0.38, 0.0]]) < 0.0
+        assert self._gap(0, 0, 0, [[0.0, 0.0]]) == pytest.approx(-0.075)
+
+    def test_nearest_of_many_wins(self):
+        assert self._gap(0, 0, 0, [[5.0, 5.0], [1.0, 0.0], [-3.0, 2.0]]) == pytest.approx(0.575)
+
+    def test_hit_threshold_and_margin(self):
+        from rl.env.geometry import box_hits_circles
+        args = (self.HL, self.HW, self.R)
+        overlapping = [[0.35 + 0.075 - 0.001, 0.0]]
+        assert box_hits_circles(0, 0, 0, np.array(overlapping), *args)
+        near = [[0.35 + 0.075 + 0.008, 0.0]]
+        assert not box_hits_circles(0, 0, 0, np.array(near), *args)
+        assert box_hits_circles(0, 0, 0, np.array(near), *args, margin=0.01)
+
+    def test_box_matches_the_gazebo_collision_box(self):
+        # The geometric test only agrees with physics if this is the box in
+        # robot_core.xacro.
+        from configs.config import MoboroboConfig
+        xacro = open(os.path.join(
+            _ROOT, "robots", "moborobo", "description", "robot_core.xacro")).read()
+        assert '<box size=".70 .470 .3"/>' in xacro
+        assert MoboroboConfig.COLLISION_BOX == (0.70, 0.47)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# step() / reset() split (used by the multi-robot env)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestStepSplit:
+    def test_apply_action_clips_and_records(self):
+        env = _make_env()
+        env._apply_action(np.array([5.0, -9.0], dtype=np.float32))
+        assert env._last_action[0] == pytest.approx(env.action_space.high[0])
+        assert env._last_action[1] == pytest.approx(env.action_space.low[1])
+
+    def test_reset_episode_state_clears_history(self):
+        env = _make_env()
+        env._pos_history.append((1.0, 2.0))
+        env._step_count = 77
+        env._episode_reward = 12.0
+        env._reset_episode_state()
+        assert len(env._pos_history) == 0
+        assert env._step_count == 0 and env._episode_reward == 0.0
+        assert env._episode == 1
+
+    def test_default_topics_are_the_single_robot_layout(self):
+        env = _make_env()
+        assert env._topic("/cmd_vel") == "/cmd_vel"
+        assert env._scan_topic == "/scan"
+        assert env._frame("base_link") == "base_link"
+
+    def test_namespace_prefixes_topics_and_frames(self):
+        env = _make_env(ns="r2", model_name="moborobo_2")
+        assert env._topic("/cmd_vel") == "/r2/cmd_vel"
+        assert env._scan_topic == "/r2/scan"
+        assert env._frame("base_link") == "r2/base_link"
+        assert env._model_name == "moborobo_2"
+
+    def test_has_scan_respects_the_stamp(self):
+        env = _make_env()
+        assert not env._has_scan()
+        env._latest_scan = np.ones(10, dtype=np.float32)
+        env._latest_scan_stamp = 5.0
+        assert env._has_scan() and env._has_scan(after_stamp=4.9)
+        assert not env._has_scan(after_stamp=5.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Multi-robot env — the parts that need no Gazebo
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestWorldCycler:
+    def test_advances_after_the_quota(self):
+        from rl.curriculum import WorldCycler
+        c = WorldCycler([3, 7, 9], episodes_per_world=2, shuffle=False)
+        assert c.current == 3
+        assert c.episode_finished() is False
+        assert c.episode_finished() is True
+        assert c.advance() == 7
+        assert c.episode_finished() is False
+
+    def test_wraps_around(self):
+        from rl.curriculum import WorldCycler
+        c = WorldCycler([3, 7], episodes_per_world=1, shuffle=False)
+        assert [c.advance() for _ in range(3)] == [7, 3, 7]
+
+    def test_every_pass_visits_each_world_once(self):
+        from rl.curriculum import WorldCycler
+        worlds = list(range(0, 50, 3))
+        c = WorldCycler(worlds, episodes_per_world=1, seed=1)
+        seq = [c.current] + [c.advance() for _ in range(3 * len(worlds) - 1)]
+        passes = [seq[i:i + len(worlds)] for i in range(0, len(seq), len(worlds))]
+        for p in passes:
+            assert sorted(p) == worlds
+        assert passes[0] != worlds                 # not index order
+        assert passes[0] != passes[1]              # reshuffled between passes
+        for i in range(1, len(seq)):
+            assert seq[i] != seq[i - 1]            # never the same world twice in a row
+
+    def test_seed_fixes_the_order(self):
+        from rl.curriculum import WorldCycler
+        def seq(seed):
+            c = WorldCycler(list(range(20)), 1, seed=seed)
+            return [c.current] + [c.advance() for _ in range(30)]
+        assert seq(5) == seq(5)
+        assert seq(5) != seq(6)
+
+    def test_new_list_waits_for_the_current_world(self):
+        from rl.curriculum import WorldCycler
+        c = WorldCycler([1, 2, 3, 4], episodes_per_world=1, seed=0)
+        before = c.current
+        c.set_world_list([10, 11, 12])
+        assert c.current == before                 # Gazebo still has this world up
+        nxt = [c.advance() for _ in range(3)]
+        assert sorted(nxt) == [10, 11, 12]         # then a full pass of the new pool
+
+    def test_new_list_without_shuffle_continues_after_current(self):
+        from rl.curriculum import WorldCycler
+        c = WorldCycler([1, 2, 3, 4], episodes_per_world=1, shuffle=False)
+        c.advance()                                # at 2
+        c.set_world_list([1, 2, 3, 4, 5])
+        assert [c.advance() for _ in range(5)] == [3, 4, 5, 1, 2]
+
+    def test_empty_list_rejected(self):
+        from rl.curriculum import WorldCycler
+        with pytest.raises(ValueError):
+            WorldCycler([], 1)
+
+
+class TestLayerNormCritic:
+    @pytest.fixture
+    def model(self):
+        from stable_baselines3 import SAC
+        from stable_baselines3.common.env_util import DummyVecEnv
+        import gymnasium as gym
+        from rl.models.critic import LayerNormSACPolicy
+        from rl.models.feature_extractor import ScanStateExtractor
+
+        class _Stub(gym.Env):
+            observation_space = gym.spaces.Dict({
+                "scan": gym.spaces.Box(0.0, 1.0, (4, 90), np.float32),
+                "state": gym.spaces.Box(-1.0, 1.0, (5,), np.float32),
+            })
+            action_space = gym.spaces.Box(-1.0, 1.0, (2,), np.float32)
+
+            def reset(self, seed=None, options=None):
+                return self.observation_space.sample(), {}
+
+            def step(self, action):
+                return self.observation_space.sample(), 0.0, False, False, {}
+
+        return SAC(LayerNormSACPolicy, DummyVecEnv([_Stub]), seed=0,
+                   learning_starts=10, buffer_size=100,
+                   policy_kwargs=dict(features_extractor_class=ScanStateExtractor,
+                                      net_arch=[64, 64]))
+
+    def test_both_critics_and_targets_have_layer_norm(self, model):
+        import torch.nn as nn
+        for critic in (model.critic, model.critic_target):
+            assert len(critic.q_networks) == 2
+            for q in critic.q_networks:
+                kinds = [type(m) for m in q]
+                assert kinds.count(nn.LayerNorm) == 2
+                assert isinstance(q[-1], nn.Linear) and q[-1].out_features == 1
+
+    def test_optimizer_trains_the_layer_norm_networks(self, model):
+        opt_params = {id(p) for g in model.critic.optimizer.param_groups for p in g["params"]}
+        for q in model.critic.q_networks:
+            assert all(id(p) in opt_params for p in q.parameters())
+
+    def test_learns_and_round_trips(self, model, tmp_path):
+        import torch as th
+        from stable_baselines3 import SAC
+        model.learn(40)
+        obs = model.observation_space.sample()
+        path = str(tmp_path / "m.zip")
+        model.save(path)
+        loaded = SAC.load(path, device="cpu")
+        assert type(loaded.policy).__name__ == "LayerNormSACPolicy"
+        a1, _ = model.predict(obs, deterministic=True)
+        a2, _ = loaded.predict(obs, deterministic=True)
+        assert np.allclose(a1, a2, atol=1e-5)
+
+
+class TestMultiRobotVecEnv:
+    @pytest.fixture
+    def venv(self, tmp_path):
+        pytest.importorskip("rospy")
+        from configs.config import SimConfig
+        prev, SimConfig.ROBOT = SimConfig.ROBOT, "moborobo"
+        from rl.env.multi_barn_env import MultiRobotBarnVecEnv
+        v = MultiRobotBarnVecEnv(n_robots=3, worlds=[0, 6], episodes_per_world=2,
+                                 log_dir=str(tmp_path))
+        yield v
+        SimConfig.ROBOT = prev
+
+    def test_each_robot_has_its_own_namespace_and_model(self, venv):
+        assert [e._ns for e in venv.envs] == ["r0", "r1", "r2"]
+        assert [e._model_name for e in venv.envs] == ["moborobo_0", "moborobo_1", "moborobo_2"]
+        assert [e._scan_topic for e in venv.envs] == ["/r0/scan", "/r1/scan", "/r2/scan"]
+
+    def test_spaces_match_the_single_robot_env(self, venv):
+        single = _make_env(robot="moborobo")
+        assert venv.num_envs == 3
+        assert venv.action_space == single.action_space
+        assert venv.observation_space["scan"].shape == single.observation_space["scan"].shape
+
+    def test_observations_are_stacked_per_key(self, venv):
+        one = {"scan": np.zeros((4, 90), np.float32), "state": np.zeros(5, np.float32)}
+        out = venv._stack([one, one, one])
+        assert out["scan"].shape == (3, 4, 90) and out["state"].shape == (3, 5)
+
+    def test_collision_uses_the_cylinder_positions(self, venv):
+        assert not venv._collides(0.0, 0.0, 0.0)            # no world loaded yet
+        venv._cylinders = np.array([[0.0, 0.4]])
+        assert not venv._collides(0.0, 0.0, 0.0)            # 9 cm off the side: clear
+        assert venv._collides(0.0, 0.0, math.pi / 2)        # the longer nose reaches it
+        assert venv._collides(0.0, 0.3, 0.0)
+
+    def test_world_quota_counts_every_robots_episodes(self, venv):
+        # 3 robots x 2 episodes each = 6 episodes on a world.
+        flags = [venv._cycler.episode_finished() for _ in range(6)]
+        assert flags == [False] * 5 + [True]
+
+    def test_curriculum_reaches_the_shared_schedule(self, venv):
+        venv.env_method("set_world_list", [40, 41, 42])
+        assert venv._cycler.advance() in (40, 41, 42)
+
+    def test_failed_launch_is_retried(self, venv, monkeypatch):
+        calls = []
+        def flaky(world_idx):
+            calls.append(world_idx)
+            if len(calls) < 3:
+                raise TimeoutError("Robots r0 did not come up")
+        monkeypatch.setattr(venv, "_launch_world_once", flaky)
+        venv._launch_world(10)
+        assert calls == [10, 10, 10]
+
+    def test_launch_gives_up_after_the_last_attempt(self, venv, monkeypatch):
+        def dead(world_idx):
+            raise TimeoutError("Robots r0 did not come up")
+        monkeypatch.setattr(venv, "_launch_world_once", dead)
+        with pytest.raises(TimeoutError):
+            venv._launch_world(10)
+
+    def test_other_launch_errors_are_not_retried(self, venv, monkeypatch):
+        calls = []
+        def stray(world_idx):
+            calls.append(world_idx)
+            raise RuntimeError("Another Gazebo server is running")
+        monkeypatch.setattr(venv, "_launch_world_once", stray)
+        with pytest.raises(RuntimeError):
+            venv._launch_world(10)
+        assert calls == [10]
+
+    def test_episode_csv_row(self, venv, tmp_path):
+        venv._log_episode(venv.envs[1], {
+            "world_idx": 6, "outcome": "success", "step": 512,
+            "episode_reward": 91.5, "dist_to_goal": 0.98})
+        rows = open(os.path.join(str(tmp_path), "episodes.csv")).read().splitlines()
+        assert rows[0].startswith("episode,world_idx,outcome,steps,total_reward")
+        assert rows[1] == "1,6,success,512,91.5000,0.9800,r1"
+
+    def test_rejects_too_many_robots(self):
+        pytest.importorskip("rospy")
+        from rl.env.multi_barn_env import MultiRobotBarnVecEnv
+        with pytest.raises(ValueError):
+            MultiRobotBarnVecEnv(n_robots=17, worlds=[0])
 
 
 # ═════════════════════════════════════════════════════════════════════════════

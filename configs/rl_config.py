@@ -23,7 +23,7 @@ class RLEnvConfig:
     # collision-avoidance literature — Fan & Long et al. ICRA'18/IJRR'20):
     #   "scan"  : (SCAN_STACK, NUM_SCAN_RAYS)  stacked min-pooled LiDAR frames
     #   "state" : (5,)  [dist_norm, sin(angle), cos(angle), last_lin, last_ang]
-    #             last_lin is in [-1, 1] (negative = reversing).
+    #             last_lin is in [-REVERSE_SPEED_RATIO, 1] (negative = reversing).
     #
     # Number of laser scan sectors in each frame.  The raw scan (moborobo:
     # ~722 rays, jackal: ~1080) is MIN-POOLED into this many sectors — min,
@@ -73,6 +73,26 @@ class RLEnvConfig:
     # against phantoms parked inside the blind ring, which measurement can
     # never clear.  150 steps @ 10 Hz = 15 s.
     SCAN_MEM_MAX_AGE: int = 150
+
+    # ── Lidar load for multi-robot training ──────────────────────────────────
+    # RS-16 vertical sampling used by MultiRobotBarnVecEnv (passed to
+    # barn_rl_robot.launch).  The stock description casts 900 x 900 rays and
+    # ships a 9.4 MB point cloud per scan; that pipeline tops out at ~16
+    # scans/s on this machine — one robot's worth — and the limit is CPU-side
+    # point handling, not rendering (moving Gazebo to the NVIDIA GPU left it
+    # unchanged).  Load scales with ray count, so several robots need fewer rays.
+    #
+    # Only the downward half matters: the lidar sits ~0.79 m above the ground
+    # and the cylinders top out at 0.5 m, so every ray above horizontal hits
+    # nothing.  It must still look steeply down — a cylinder 0.45 m away is
+    # only visible below -33 deg — which is why this is not the real RS-16's
+    # +-15 deg.  The single-robot env and the benchmark keep the stock profile.
+    MULTI_LIDAR_PROFILE = {
+        "lidar_v_samples": 64,
+        "lidar_v_min": -0.785,      # rad (-45 deg)
+        "lidar_v_max": 0.0,
+        "lidar_max_range": 10.0,    # m — pointcloud_to_laserscan's range_max
+    }
 
     # ── Timing ───────────────────────────────────────────────────────────────
     # Seconds of simulated time per step (Gazebo runs at ~1× real-time).
@@ -160,7 +180,14 @@ class RLEnvConfig:
     # corner it has nosed into instead of having to spin in place inside the
     # blind ring.  Kept slower than forward because jackal's UST-10 only sees
     # 270 deg — its rear is covered by the scan memory alone.
-    REVERSE_SPEED_RATIO: float = 1
+    #
+    # The ratio also sets where the *untrained* policy sits: SAC's tanh output
+    # of 0 maps to the middle of the range.  At 1.0 the range is symmetric, the
+    # middle is 0 m/s, and a noisy policy dithers in place — measured over 300
+    # uniform-random steps: -0.08 m of progress at 1.0 against +1.62 m at 0.3.
+    # That zero-mean jitter is what the `reverse_v1` run collapsed into, so the
+    # range must stay forward-biased.
+    REVERSE_SPEED_RATIO: float = 0.3
 
     # Per-step penalty while reversing:
     #   r_reverse = -REWARD_REVERSE_SCALE * |lin| / max_linear   (lin < 0 only)
@@ -201,38 +228,61 @@ class RLEnvConfig:
     # whole operating range while still costing -0.067/step at the mean.
     REWARD_PATH_SCALE: float = 0.15
     PATH_MAX_DEV: float = 1.0   # metres — deviation past this is clipped
+    # The dataset paths are 8-connected A* on a 0.15 m grid, so they run in
+    # staircases and hug the edges of the inflated obstacle map, with detours
+    # no driver would take.  When True the path is shortened by string pulling
+    # (rl/env/geometry.py:shortcut_path) before it is used — never into a
+    # segment tighter than the stretch of original path it replaces, so the
+    # corridor the penalty asks for stays at least as wide as before.
+    PATH_SMOOTHING: bool = True
 
     # If True, apply REWARD_PROGRESS_SCALE * (prev_dist - curr_dist) every step.
     # Kept as a kill-switch for ablations / sparse-reward experiments.
     REWARD_SHAPING: bool = True
 
-    # ── Terminal potential ───────────────────────────────────────────────────
-    # Progress shaping is potential-based with Phi(s) = -progress_scale * d(s).
-    # Summed over an episode the per-step term telescopes to
-    # Phi(s_T) - Phi(s_0), so Ng et al. (1999) policy invariance — which needs
-    # Phi(s_T) = 0 — makes total shaping the constant +progress_scale * d_0 for
-    # EVERY trajectory.  That constant is the whole point: it means shaping
-    # cannot rank outcomes, and success > timeout > collision is
-    # decided purely by the terminal rewards above.
+    # ── Stuck termination ────────────────────────────────────────────────────
+    # End the episode as a genuine terminal when the robot has not gone
+    # anywhere: its position is within STUCK_MIN_DISPLACEMENT_M of where it was
+    # STUCK_WINDOW_STEPS ago.  Measured as net displacement, not progress
+    # toward the goal, so a lateral detour or backing out of a trap never
+    # trips it — only standing still or dithering does.
     #
-    # Enforcing Phi(s_T) = 0 means ADDING BACK the potential left in the
-    # terminal state, +progress_scale * dist.  Sign discipline matters here:
-    # subtracting it instead is off by 2 * progress_scale * dist (150 points at
-    # 6 m) and makes failing early vastly worse than failing late.  That
-    # variant was tried and it taught the policy to stop dead mid-course rather
-    # than risk a terminal — timeouts went 2.5% -> 17% and success fell to 29%.
-    # `test_total_shaping_is_independent_of_where_the_episode_ends` locks the
-    # invariant down.
+    # Two jobs.  It stops a stalled policy from burning the full step budget
+    # (89% of `reverse_v1`'s 240k steps went into 1000-step timeouts that never
+    # left the start area), and it gives the critic a real terminal to anchor
+    # on: a timeout is bootstrapped, so a buffer holding only timeouts leaves
+    # the Q level undetermined and free to drift.
     #
-    # Applied only to `terminated` (collision / goal), never to
-    # `truncated` — a time limit is a bootstrap cutoff, not a terminal state,
-    # so the critic accounts for the rest through V(s_final).
+    # As costly as a collision.  It was -25 (half a collision) so that
+    # stopping when boxed in would beat ramming the obstacle, but the policy
+    # turned that into a cheap way out: in `multi_v3` (200k steps) 148 of 430
+    # episodes ended stuck against 124 collisions, nearly all of them dithering
+    # forward and back (54% of steps reversing) ~0.6 m in front of the first
+    # obstacles instead of trying to get round them.  Giving up must not pay
+    # better than trying.
+    STUCK_TERMINATION: bool = True
+    STUCK_WINDOW_STEPS: int = 200          # 20 s at 10 Hz
+    STUCK_MIN_DISPLACEMENT_M: float = 0.3  # i.e. under 0.015 m/s net
+    REWARD_STUCK: float = -50.0
+
+    # ── Terminal potential (OFF — kept for ablation only) ────────────────────
+    # When True, a terminal transition is paid +progress_scale * dist so the
+    # progress shaping becomes potential-based with Phi(terminal) = 0 (Ng et
+    # al. 1999) and sums to the same constant for every trajectory.
     #
-    # NOTE: this only behaves if the discount horizon reaches the goal. With
-    # gamma=0.99 at 10 Hz the horizon is 100 steps (2 m) and the goal is worth
-    # +0.7, so correct shaping plus a myopic gamma still yields a policy that
-    # freezes or charges. The trainers default to gamma=0.999 for this reason.
-    TERMINAL_POTENTIAL_ZERO: bool = True
+    # That is exactly why it is off.  Making the shaping unable to rank
+    # outcomes removes progress as an incentive: crashing at 8 m and at 2 m
+    # score the same, a collision transition is paid +12.5 * dist - 50 (+40 at
+    # 7 m), and the only reason left to move is a goal 500+ steps away.  That
+    # in turn needs gamma -> 1, and at gamma=0.999 the critic has almost no
+    # contraction: in the `reverse_v1` run it drifted to Q = +716 against a
+    # physical maximum of 225, went flat across actions, and the policy
+    # decayed into noise.
+    #
+    # With it off, progress is a real reward (+0.25/step at full speed), which
+    # is the signal the Jul/Aug runs learned from (47-63% success) and which
+    # works with gamma=0.99.
+    TERMINAL_POTENTIAL_ZERO: bool = False
 
 
 # ── Model / network architecture ──────────────────────────────────────────────
@@ -259,6 +309,11 @@ class RLModelConfig:
 
     # Hidden layers of the actor/critic heads after feature concat.
     NET_ARCH = [256, 256]
+
+    # LayerNorm after every hidden layer of the twin critics
+    # (rl/models/critic.py).  Added after `multi_v4`, whose stock critic
+    # diverged to Q ≈ +7000 on a buffer whose rewards never exceeded +0.35.
+    CRITIC_LAYER_NORM: bool = True
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────

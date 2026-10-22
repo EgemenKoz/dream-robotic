@@ -7,9 +7,13 @@ How the RL stack fits together end-to-end: env, observation, action, reward, tra
 ```
 rl/
 ├── env/
-│   └── barn_env.py              # BarnEnv — Gymnasium wrapper around Gazebo
+│   ├── barn_env.py              # BarnEnv — Gymnasium wrapper around Gazebo
+│   ├── multi_barn_env.py        # MultiRobotBarnVecEnv — N ghost robots in one world (--n-robots)
+│   └── geometry.py              # box-vs-cylinder collision test used by the multi-robot env
+├── curriculum.py                # difficulty tiers, curriculum phases, world cycling
 ├── models/
-│   └── feature_extractor.py     # ScanStateExtractor — two-branch CNN+FC encoder
+│   ├── feature_extractor.py     # ScanStateExtractor — two-branch CNN+FC encoder
+│   └── critic.py                # LayerNormSACPolicy — twin critics with LayerNorm
 ├── controllers/
 │   └── rl_sac_controller.py     # SACController — loads a trained policy for the benchmark
 ├── logging/
@@ -17,6 +21,8 @@ rl/
 └── tests/test_barn_env.py       # unit + (optional) Gazebo integration tests
 
 train_sac.py                     # entry point: SB3 SAC + world-cycling wrapper
+tools/sim_probe.py               # single-robot timing probe (RTF, scan rate, step cost)
+tools/multi_probe.py             # multi-robot checks: ghosts, lidar equivalence, capacity
 configs/rl_config.py             # single source of truth for env / model / log / eval defaults
 ```
 
@@ -122,12 +128,15 @@ obs["state"] (5,)   ─► FC 32 ───────────────�
 - A flat-MLP baseline must *learn* that ray *i* and *i+1* are neighbours;
   the conv bakes this locality in, which is the main sample-efficiency win.
 - All sizes configurable in `RLModelConfig` (`configs/rl_config.py`).
+- With `RLModelConfig.CRITIC_LAYER_NORM` (default on) the twin critics put a
+  LayerNorm after each hidden layer (`rl/models/critic.py`). Without it
+  `multi_v4` diverged to Q ≈ +7000 on rewards that never exceeded +0.35.
 
 ## Action (dim 2, `Box`)
 
 | Index | Feature       | Range                                   |
 | ----- | ------------- | --------------------------------------- |
-| `[0]` | `linear_x`    | `[-REVERSE_SPEED_RATIO·MAX_LINEAR, MAX_LINEAR]` — reverse allowed (half speed) |
+| `[0]` | `linear_x`    | `[-REVERSE_SPEED_RATIO·MAX_LINEAR, MAX_LINEAR]` — reverse allowed (0.3× speed) |
 | `[1]` | `angular_z`   | `[-MAX_ANGULAR, +MAX_ANGULAR]`          |
 
 Per-robot limits (`configs/config.py`):
@@ -177,11 +186,13 @@ Terminal additions:
 | Collision   | `-50`  | `terminated` | contact reported on `/collision`    |
 | Timeout     | none   | `truncated`  | `MAX_EPISODE_STEPS`                 |
 
-On any `terminated` transition the shaping potential is zeroed
-(`TERMINAL_POTENTIAL_ZERO`): `r += +REWARD_PROGRESS_SCALE * d`, which makes the
-total shaping over *any* episode the constant `+REWARD_PROGRESS_SCALE * d_0`
-(= +125). Truncation is exempt — a time limit is a bootstrap cutoff, not a
-terminal state, so the critic accounts for the remainder through `V(s_final)`.
+| Stuck       | `-50`  | `terminated` | within `STUCK_MIN_DISPLACEMENT_M` (0.3 m) of the position `STUCK_WINDOW_STEPS` (200) ago |
+
+Progress is a real reward: an episode keeps whatever it banked before it ended.
+`TERMINAL_POTENTIAL_ZERO` (paying `+REWARD_PROGRESS_SCALE * d` on `terminated`
+so the shaping sums to a constant) still exists for ablation but is **off** —
+see the note under *Design notes* below. The paragraph that follows describes
+that ablation mode.
 
 > **Sign discipline.** The correction *adds* the leftover potential. Subtracting
 > it is off by `2 × scale × d` — 150 points at 6 m — and makes failing early far
@@ -206,29 +217,29 @@ terminal state, so the critic accounts for the remainder through `V(s_final)`.
 - **Heading**: small penalty for not facing the goal makes the agent prefer
   forward motion along the goal vector rather than circling.
 - **Reverse (`× 0.05`)**: the linear action goes down to
-  `-REVERSE_SPEED_RATIO × max_linear` (half speed) so the policy can back out
-  of a dead end instead of spinning inside the blind ring. A small
+  `-REVERSE_SPEED_RATIO × max_linear` (0.3× speed) so the policy can back out
+  of a dead end instead of spinning inside the blind ring. The range is kept
+  forward-biased on purpose: tanh output 0 maps to its middle, and a symmetric
+  range makes an untrained policy dither in place. A small
   `-0.05 × |lin| / max_linear` per-step cost keeps it from driving the course
   backwards. While reversing, the proximity penalty looks at the **rear** arc
   (`PROX_ARC` centred on π) instead of the front. Jackal's UST-10 only covers
   270°, so its rear is seen through the scan memory alone.
-- **Zeroing the terminal potential**: progress shaping is potential-based with
-  `Φ(s) = -scale × d`, and Ng et al. (1999) invariance requires
-  `Φ(terminal) = 0`. Without it a crash *kept* the progress it had banked: at
-  the measured mean collision distance of 6.05 m the agent pocketed
-  `12.5 × 3.95 = +49.4` against `-50`, for an episode return of **-15.85**
-  versus a timeout's **-12.62** — crashing cost only 3.2 points more than
-  stopping, and two logged collisions scored *positive*. With the correction
-  the shaping contributes the same `+125` to every episode, so the ordering
-  comes from the terminal rewards alone.
-- **`--gamma 0.999`**: not a cosmetic default. At 10 Hz, `0.99` gives an
-  effective horizon of `1/(1-γ) = 100` steps = 10 s = **2 m** at 0.2 m/s. The
-  goal sits ~500 steps out and is discounted to **+0.7** — invisible. The
-  policy then optimises dense shaping alone, and compares a small per-step
-  cost against an imminent large terminal penalty. Freezing wins that
-  comparison. Measured break-even at `γ=0.99`: the agent must believe it has a
-  **76%** chance of getting through before moving beats standing still. At
-  `γ=0.999` that threshold drops to **~0%**.
+- **Terminal potential is off; `--gamma 0.99`** (changed 2026-10-13). The
+  potential-based variant (`TERMINAL_POTENTIAL_ZERO=True`) made the shaping
+  contribute the same `+125` to every episode, which removes progress as an
+  incentive: a collision transition is paid `+12.5 × d − 50` (+40 at 7 m) and
+  the only reason left to move is a goal 500+ steps away. That forced
+  `γ=0.999`, where the target `r + 0.999·Q` barely contracts. In the
+  `reverse_v1` run (240k steps) the critic drifted to **Q = +716** against a
+  physical maximum of 225, went flat across actions (full-forward 713.2, stop
+  712.8, full-reverse 712.4), and the policy decayed into zero-mean jitter —
+  89% of the steps were spent in timeouts that never left the start area. The
+  Jul/Aug runs with real progress reward and `γ=0.99` reached 47–63% success.
+- **Stuck termination**: standing still or dithering ends the episode as a
+  real terminal (`-50`, as costly as a collision), so a stalled policy cannot burn the 1000-step budget
+  and the critic always has terminals to anchor on. It is measured as net
+  displacement, so a sideways detour or backing out of a trap never trips it.
 - **Path-deviation (`× 0.15`, clipped at 1.0 m)**: the A* reference path from
   `path_N.npy` is a *reward-only* supervisor — never added to the observation.
   At the old `0.03 / 1.5 m` it was noise: -0.008/step at the deviation the
@@ -270,7 +281,7 @@ make the necessary passages unprofitable and freeze the robot.
     a realistic 0.13 m/s average needs ~75 s to clear the 10 m course)
 - **Algorithm**: SB3 SAC, `MultiInputPolicy` with the two-branch
   `ScanStateExtractor` (CNN scan + FC state) and `[256, 256]` heads.
-- **Optimizer**: Adam, `lr=3e-4`, `batch_size=256`, `buffer_size=100_000`,
+- **Optimizer**: Adam, `lr=3e-4`, `batch_size=256`, `buffer_size=300_000`,
   `learning_starts=1_000`, `gamma=0.99`, `tau=0.005`, entropy coef auto.
 - **World cycling**: `WorldCyclingEnv` (subclass of `BarnEnv`) fixes a world
   for N episodes (default 5) then advances. Restarting Gazebo costs ~10 s, so
@@ -380,13 +391,17 @@ training observation exactly:
 | `PROX_RAMP_START_M`           | 0.90    | Metres — where the prox penalty begins.       |
 | `PROX_FLOOR_M`                | 0.50    | Metres — where it saturates.                  |
 | `PROX_ARC`                    | 2.0944  | Radians — half-angle of the travel-direction arc. |
-| `REVERSE_SPEED_RATIO`         | 0.5     | Reverse speed limit as a fraction of max.     |
+| `REVERSE_SPEED_RATIO`         | 0.3     | Reverse speed limit as a fraction of max.     |
 | `REWARD_REVERSE_SCALE`        | 0.05    | Per-step penalty scale while reversing.       |
 | `REWARD_HEADING_SCALE`        | 0.02    | Heading-misalignment penalty scale.           |
 | `PATH_FOLLOW_SHAPING`         | `True`  | Enable A* path-deviation penalty.             |
 | `REWARD_PATH_SCALE`           | 0.15    | Scale of the path-deviation penalty.          |
 | `PATH_MAX_DEV`                | 1.0     | Metres past which the deviation is clipped.   |
-| `TERMINAL_POTENTIAL_ZERO`     | `True`  | Hand back banked progress on `terminated`.    |
+| `TERMINAL_POTENTIAL_ZERO`     | `False` | Ablation: pay `+scale·d` on `terminated`.     |
+| `STUCK_TERMINATION`           | `True`  | Terminate when the robot goes nowhere.        |
+| `STUCK_WINDOW_STEPS`          | 200     | Steps the displacement is measured over.      |
+| `STUCK_MIN_DISPLACEMENT_M`    | 0.3     | Metres — less than this in the window = stuck. |
+| `REWARD_STUCK`                | -50     | Terminal reward on a stuck termination.       |
 | `REWARD_SHAPING`              | `True`  | Master kill-switch for all shaping terms.     |
 
 Set `REWARD_SHAPING=False` for a sparse-reward ablation (goal/collision/step only).

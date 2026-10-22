@@ -19,7 +19,8 @@ collision-avoidance literature — Fan & Long et al. ICRA'18 / IJRR'20):
   act  = [linear_x, angular_z]  — linear_x may be negative (reverse), down to
          -RLEnvConfig.REVERSE_SPEED_RATIO * max_linear.
 
-Episodes end on contact, on reaching the goal, or on the step limit.
+Episodes end on contact, on reaching the goal, when the robot has stopped
+going anywhere (RLEnvConfig.STUCK_TERMINATION), or on the step limit.
 
 Quick start — Gazebo already running externally:
     env = BarnEnv(robot="moborobo", world_idx=30, managed=False)
@@ -34,6 +35,7 @@ Quick start — env manages Gazebo (launches/kills per world change):
 
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -41,7 +43,7 @@ import threading
 import time
 from collections import deque
 from os.path import join
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import gymnasium as gym
@@ -64,6 +66,7 @@ from configs.config import (
     RobotConfig, SimConfig, WorldConfig, apply_env,
 )
 from configs.rl_config import RLEnvConfig, RLLogConfig
+from rl.env.geometry import shortcut_path, world_cylinders
 
 # GazeboSimulation lives in the local gazebo/ package inside this project.
 from gazebo.gazebo_simulation import GazeboSimulation
@@ -162,8 +165,24 @@ class BarnEnv(gym.Env):
     reward_reverse_scale : float
         Per-step penalty scale while reversing (-scale * |lin| / max_linear).
     terminal_potential_zero : bool
-        Subtract the un-cashed progress potential on terminal transitions so
-        that shaping stays policy-invariant (Ng et al. 1999).
+        Ablation only (default off): pay +progress_scale * dist on terminal
+        transitions so the progress shaping is potential-based.  See
+        RLEnvConfig.TERMINAL_POTENTIAL_ZERO for why this is not the default.
+    stuck_termination : bool
+        Terminate (a real terminal, not a truncation) when the robot is within
+        `stuck_min_displacement` metres of where it was `stuck_window_steps`
+        steps ago.
+    reward_stuck : float
+        Terminal reward on a stuck termination (negative).
+    ns : str
+        ROS namespace of this robot's topics ("" = the single-robot layout:
+        /cmd_vel, /scan).  Set by MultiRobotBarnVecEnv, which runs several
+        robots in one Gazebo world.
+    model_name : str | None
+        Gazebo model name (default: the robot's standard name).
+    collision_fn : callable | None
+        (x, y, yaw) -> bool.  When given it replaces the /collision topic as
+        the collision test.
     """
 
     metadata = {"render_modes": []}
@@ -197,6 +216,13 @@ class BarnEnv(gym.Env):
         reverse_speed_ratio: float = RLEnvConfig.REVERSE_SPEED_RATIO,
         reward_reverse_scale: float = RLEnvConfig.REWARD_REVERSE_SCALE,
         terminal_potential_zero: bool = RLEnvConfig.TERMINAL_POTENTIAL_ZERO,
+        stuck_termination: bool = RLEnvConfig.STUCK_TERMINATION,
+        stuck_window_steps: int = RLEnvConfig.STUCK_WINDOW_STEPS,
+        stuck_min_displacement: float = RLEnvConfig.STUCK_MIN_DISPLACEMENT_M,
+        reward_stuck: float = RLEnvConfig.REWARD_STUCK,
+        ns: str = "",
+        model_name: Optional[str] = None,
+        collision_fn: Optional[Callable[[float, float, float], bool]] = None,
     ):
         super().__init__()
 
@@ -236,12 +262,18 @@ class BarnEnv(gym.Env):
         self._scan_memory_on = scan_memory
         self._r_reverse_scale = reward_reverse_scale
         self._terminal_potential_zero = terminal_potential_zero
+        self._stuck_termination = stuck_termination
+        self._stuck_window = int(stuck_window_steps)
+        self._stuck_min_disp = float(stuck_min_displacement)
+        self._r_stuck = reward_stuck
         # Loaded lazily on world change; None disables the path penalty for
         # this episode (e.g. when path_N.npy is missing).
         self._ref_path: Optional[np.ndarray] = None
 
-        self._scan_topic = _SCAN_TOPIC[robot]
-        self._model_name = _MODEL_NAME[robot]
+        self._ns = ns.strip("/")
+        self._scan_topic = self._topic(_SCAN_TOPIC[robot])
+        self._model_name = model_name or _MODEL_NAME[robot]
+        self._collision_fn = collision_fn
         self._max_linear = _MAX_LINEAR[robot]
         self._max_angular = _MAX_ANGULAR[robot]
         self._max_reverse = float(reverse_speed_ratio) * self._max_linear
@@ -308,6 +340,9 @@ class BarnEnv(gym.Env):
         # Rolling scan-frame history for obs["scan"]; cleared on reset and
         # re-seeded with K copies of the first frame of the episode.
         self._scan_history: deque = deque(maxlen=scan_stack)
+        # (x, y) per step for the stuck check.  window + 1 entries so the
+        # oldest one is exactly `window` steps behind the newest.
+        self._pos_history: deque = deque(maxlen=self._stuck_window + 1)
         # Per-sector fused range in metres for the newest frame, plus the
         # "directly measured this step" mask.  Kept unnormalised because the
         # proximity penalty is specified in metres.
@@ -338,6 +373,7 @@ class BarnEnv(gym.Env):
         self._ref_path_pub: Optional[rospy.Publisher] = None
 
         self._latest_scan: Optional[np.ndarray] = None
+        self._latest_scan_stamp: float = 0.0   # sim time of the newest scan
         self._scan_angle_min: float = -math.pi
         self._scan_angle_increment: float = 0.0087   # default from barn_move_base.launch
         self._scan_lock = threading.Lock()
@@ -349,6 +385,9 @@ class BarnEnv(gym.Env):
         # for several seconds, during which any rospy ServiceProxy.call() to
         # /gazebo/* would hang forever.  We use this PID to fail fast instead.
         self._gzserver_pid: Optional[int] = None
+        # Resolved once; cleared for the rest of the run if Gazebo fails to
+        # come up with it (see _restart_gazebo).
+        self._nvidia_offload: bool = _nvidia_offload_wanted()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Gymnasium API
@@ -361,14 +400,7 @@ class BarnEnv(gym.Env):
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
-
-        self._episode += 1
-        self._step_count = 0
-        self._episode_reward = 0.0
-        self._last_action = np.zeros(2, dtype=np.float32)
-        self._scan_history.clear()
-        if self._scan_mem is not None:
-            self._scan_mem.reset()
+        self._reset_episode_state()
 
         # Choose world
         if self._fixed_world_idx is not None:
@@ -385,9 +417,7 @@ class BarnEnv(gym.Env):
             if not self._ros_ready:
                 self._connect_ros()
 
-        if world_changed or self._ref_path is None:
-            self._ref_path = self._load_ref_path(target_world)
-        self._current_world_idx = target_world
+        self._set_world(target_world)
 
         # Fail fast if gzserver died between _restart_gazebo and now —
         # otherwise the unpause() service call below blocks forever.
@@ -419,11 +449,33 @@ class BarnEnv(gym.Env):
             print("    [reset] Waiting for first LaserScan on %s..." % self._scan_topic,
                   flush=True)
         self._wait_for_scan()
+        return self._first_obs()
 
+    def _reset_episode_state(self):
+        """Clear everything that belongs to the episode that just ended."""
+        self._episode += 1
+        self._step_count = 0
+        self._episode_reward = 0.0
+        self._last_action = np.zeros(2, dtype=np.float32)
+        self._scan_history.clear()
+        self._pos_history.clear()
+        if self._scan_mem is not None:
+            self._scan_mem.reset()
+
+    def _set_world(self, world_idx: int):
+        """Record the active world and load its reference path."""
+        if world_idx != self._current_world_idx or self._ref_path is None:
+            self._ref_path = self._load_ref_path(world_idx)
+        self._current_world_idx = world_idx
+
+    def _first_obs(self) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """Observation and info for the first step of an episode.  The robot
+        must already be at the start pose with a scan taken from there."""
         state = self._gazebo_sim.get_model_state()
         p, o = state.pose.position, state.pose.orientation
         obs = self._build_obs((p.x, p.y, _quat_to_yaw(o.x, o.y, o.z, o.w)))
         self._prev_dist = _dist(self._goal_pos, (p.x, p.y))
+        self._pos_history.append((p.x, p.y))
 
         # NOTE: the key is "episode_idx" (not "episode") to avoid clashing with
         # SB3's Monitor wrapper, which writes info["episode"] = {"r","l","t"} on
@@ -433,17 +485,32 @@ class BarnEnv(gym.Env):
     def step(
         self, action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        lin = float(action[0])
-        ang = float(action[1])
-        self._last_action[0] = lin
-        self._last_action[1] = ang
+        self._apply_action(action)
+        self._advance_sim()
+        return self._finish_step()
 
-        # Run physics for one timestep
+    # step() in three parts, so MultiRobotBarnVecEnv can apply every robot's
+    # action, advance the shared simulation once, then finish every robot.
+
+    def _apply_action(self, action: np.ndarray):
+        """Clip and record the action. Nothing is sent to the robot yet."""
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._last_action[0] = float(action[0])
+        self._last_action[1] = float(action[1])
+
+    def _publish_action(self):
+        self._pub_cmd(float(self._last_action[0]), float(self._last_action[1]))
+
+    def _advance_sim(self):
+        """Run physics for one timestep with the recorded action."""
         self._gazebo_sim.unpause()
-        self._pub_cmd(lin, ang)
+        self._publish_action()
         time.sleep(self.step_duration)
         self._gazebo_sim.pause()
+
+    def _finish_step(self) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Observe, score and terminate — everything after the physics ran."""
+        lin = float(self._last_action[0])
 
         # Observe — one Gazebo service call, shared by the obs and the reward.
         state = self._gazebo_sim.get_model_state()
@@ -452,7 +519,11 @@ class BarnEnv(gym.Env):
         yaw = _quat_to_yaw(ori.x, ori.y, ori.z, ori.w)
         obs = self._build_obs((pos.x, pos.y, yaw))
         curr_dist = _dist(self._goal_pos, (pos.x, pos.y))
-        collided = self._gazebo_sim.get_hard_collision()
+        self._pos_history.append((pos.x, pos.y))
+        if self._collision_fn is not None:
+            collided = bool(self._collision_fn(pos.x, pos.y, yaw))
+        else:
+            collided = self._gazebo_sim.get_hard_collision()
         # Metres, over the arc around the direction of travel (rear arc when
         # reversing), fused with the near-field memory — this is the quantity
         # the proximity penalty is defined against.
@@ -465,6 +536,7 @@ class BarnEnv(gym.Env):
         r_heading = 0.0
         r_path = 0.0
         r_reverse = 0.0
+        r_stuck = 0.0
         r_terminal_phi = 0.0
         path_dev = 0.0
         if self._r_shaping:
@@ -520,32 +592,24 @@ class BarnEnv(gym.Env):
             outcome = "success"
         else:
             self._step_count += 1
-            if self._step_count >= self.max_episode_steps:
+            if self._stuck_termination and _is_stuck(
+                    self._pos_history, self._stuck_window, self._stuck_min_disp):
+                # A real terminal, unlike the time limit below: the critic
+                # gets no bootstrap, so "going nowhere" has a definite value.
+                r_stuck = float(self._r_stuck)
+                reward += r_stuck
+                terminated = True
+                outcome = "stuck"
+            elif self._step_count >= self.max_episode_steps:
                 truncated = True
                 outcome = "timeout"
             else:
                 outcome = "running"
 
-        # Zero the shaping potential at genuine terminal states.
-        #
-        # Progress shaping is Phi(s) = -progress_scale * dist, so the per-step
-        # term is Phi(s') - Phi(s) and the episode telescopes to
-        # Phi(s_T) - Phi(s_0).  Ng et al. (1999) policy invariance needs
-        # Phi(s_T) = 0, which makes the total shaping the constant
-        # +progress_scale * d_0 for every trajectory — that is what stops the
-        # shaping from ranking outcomes on its own.
-        #
-        # Forcing Phi(s_T) = 0 therefore means ADDING BACK the potential still
-        # sitting in the terminal state, +progress_scale * dist.  The sign
-        # matters enormously: the first cut of this subtracted it instead,
-        # which is off by 2 * progress_scale * dist (150 points at 6 m).  That
-        # turned an early failure into a -85 catastrophe against a -63 freeze
-        # and taught the policy to stop dead mid-course — timeouts went 2.5% ->
-        # 17% and the robot sat still for the rest of the episode.
-        #
-        # Not applied on truncation: a time limit is a bootstrap cutoff, not a
-        # terminal state, so the critic accounts for the remaining potential
-        # through V(s_final).
+        # Ablation only (off by default, see RLEnvConfig.TERMINAL_POTENTIAL_ZERO):
+        # pay back the potential still sitting in a terminal state so the
+        # progress shaping telescopes to the same constant for every episode.
+        # Never applied on truncation — a time limit is a bootstrap cutoff.
         if terminated and self._r_shaping and self._terminal_potential_zero:
             r_terminal_phi = self._r_progress_scale * curr_dist
             reward += r_terminal_phi
@@ -574,6 +638,7 @@ class BarnEnv(gym.Env):
                 "path": r_path,
                 "path_dev_m": path_dev,
                 "reverse": r_reverse,
+                "stuck": r_stuck,
                 "terminal_phi": r_terminal_phi,
             },
         }
@@ -633,8 +698,10 @@ class BarnEnv(gym.Env):
         gz_log  = open(gz_log_path,  "w")
         nav_log = open(nav_log_path, "w")
 
-        print("    [setup] Launching Gazebo (world %d)... log=%s"
-              % (world_idx, gz_log_path), flush=True)
+        print("    [setup] Launching Gazebo (world %d)%s... log=%s"
+              % (world_idx, " on NVIDIA" if self._nvidia_offload else "",
+                 gz_log_path), flush=True)
+        gz_env = _gazebo_process_env(self._nvidia_offload)
         if self.robot == "jackal":
             import rospkg
             base = rospkg.RosPack().get_path("jackal_helper")
@@ -645,7 +712,7 @@ class BarnEnv(gym.Env):
                     "world_name:=" + world_file,
                     "gui:=" + ("true" if self.gui else "false"),
                 ],
-                stdout=gz_log, stderr=gz_log,
+                stdout=gz_log, stderr=gz_log, env=gz_env,
             )
         else:
             self._gazebo_proc = subprocess.Popen(
@@ -657,7 +724,7 @@ class BarnEnv(gym.Env):
                     "headless:=" + ("false" if self.gui else "true"),
                     "use_collision_publisher:=true",
                 ],
-                stdout=gz_log, stderr=gz_log,
+                stdout=gz_log, stderr=gz_log, env=gz_env,
             )
             # barn_move_base.launch provides pointcloud_to_laserscan → /scan.
             # move_base idles because we never send it a goal.
@@ -668,6 +735,29 @@ class BarnEnv(gym.Env):
 
         # ── Poll for Gazebo services instead of fixed sleep — surfaces a
         # crashed gzserver fast (and avoids hangs when 5s isn't enough). ───────
+        try:
+            self._wait_for_gazebo(gz_log_path)
+        except (RuntimeError, TimeoutError) as exc:
+            if not self._nvidia_offload:
+                raise
+            # The only thing this run does differently from a stock launch is
+            # the render offload, so drop it and try once more before failing.
+            print("    [setup] Gazebo did not start with NVIDIA offload (%s); "
+                  "retrying on the default GPU." % exc, flush=True)
+            self._nvidia_offload = False
+            return self._restart_gazebo(world_idx)
+
+        # Connect ROS (lazy — only really does work on the first reset).
+        self._connect_ros()
+        # The proxies created by GazeboSimulation point at the freshly started
+        # gzserver — must be recreated on every world change.
+        self._gazebo_sim = GazeboSimulation(
+            init_position=list(WorldConfig.STATIC_INIT_POSITION),
+            model_name=self._model_name,
+        )
+
+    def _wait_for_gazebo(self, gz_log_path: str):
+        """Block until Gazebo's services answer and gzserver's PID is known."""
         print("    [setup] Waiting for Gazebo services...", end="", flush=True)
         t0 = time.time()
         while time.time() - t0 < _GAZEBO_SVC_TIMEOUT:
@@ -700,15 +790,6 @@ class BarnEnv(gym.Env):
                 "gzserver process not found after services came up. "
                 "See %s for the crash." % gz_log_path
             )
-
-        # Connect ROS (lazy — only really does work on the first reset).
-        self._connect_ros()
-        # The proxies created by GazeboSimulation point at the freshly started
-        # gzserver — must be recreated on every world change.
-        self._gazebo_sim = GazeboSimulation(
-            init_position=list(WorldConfig.STATIC_INIT_POSITION),
-            model_name=self._model_name,
-        )
 
     def _ensure_roscore(self):
         """Lazy-start a persistent roscore that outlives Gazebo restarts."""
@@ -793,18 +874,28 @@ class BarnEnv(gym.Env):
             except rospy.exceptions.ROSException:
                 pass  # already initialised in this process
 
-            self._cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+            self._cmd_vel_pub = rospy.Publisher(
+                self._topic("/cmd_vel"), Twist, queue_size=1)
             self._mem_cloud_pub = rospy.Publisher(
-                _MEM_CLOUD_TOPIC, PointCloud2, queue_size=1)
+                self._topic(_MEM_CLOUD_TOPIC), PointCloud2, queue_size=1)
             self._fused_scan_pub = rospy.Publisher(
-                _FUSED_SCAN_TOPIC, LaserScan, queue_size=1)
+                self._topic(_FUSED_SCAN_TOPIC), LaserScan, queue_size=1)
             self._ref_path_pub = rospy.Publisher(
-                _REF_PATH_TOPIC, Path, queue_size=1)
+                self._topic(_REF_PATH_TOPIC), Path, queue_size=1)
             rospy.Subscriber(
                 self._scan_topic, LaserScan, self._scan_cb, queue_size=1,
                 buff_size=2 ** 20,
             )
             self._ros_ready = True
+
+    def _topic(self, name: str) -> str:
+        """`name` under this robot's namespace ("/scan" -> "/r0/scan")."""
+        name = "/" + name.lstrip("/")
+        return ("/" + self._ns + name) if self._ns else name
+
+    def _frame(self, name: str) -> str:
+        """TF frame under this robot's prefix ("base_link" -> "r0/base_link")."""
+        return (self._ns + "/" + name) if self._ns else name
 
     def _scan_cb(self, msg: LaserScan):
         ranges = np.array(msg.ranges, dtype=np.float32)
@@ -826,16 +917,23 @@ class BarnEnv(gym.Env):
         ranges[invalid] = np.nan
         with self._scan_lock:
             self._latest_scan = ranges
+            self._latest_scan_stamp = msg.header.stamp.to_sec()
             self._scan_angle_min = float(msg.angle_min)
             self._scan_angle_increment = float(msg.angle_increment)
 
-    def _wait_for_scan(self):
+    def _has_scan(self, after_stamp: Optional[float] = None) -> bool:
+        """Is there a scan — and, if `after_stamp` is given, one taken later
+        than that sim time?"""
+        with self._scan_lock:
+            return self._latest_scan is not None and (
+                after_stamp is None or self._latest_scan_stamp > after_stamp)
+
+    def _wait_for_scan(self, after_stamp: Optional[float] = None):
         deadline = time.time() + _SCAN_WAIT_TIMEOUT
         last_health_check = 0.0
         while time.time() < deadline:
-            with self._scan_lock:
-                if self._latest_scan is not None:
-                    return
+            if self._has_scan(after_stamp):
+                return
             # Cheap process-liveness check every 1 s so a crashed gzserver
             # surfaces immediately instead of blocking the whole timeout.
             if time.time() - last_health_check > 1.0:
@@ -973,7 +1071,7 @@ class BarnEnv(gym.Env):
         want_scan = self._fused_scan_pub.get_num_connections() > 0
         if not (want_cloud or want_scan):
             return
-        header = Header(stamp=rospy.Time.now(), frame_id="base_link")
+        header = Header(stamp=rospy.Time.now(), frame_id=self._frame("base_link"))
 
         if want_cloud:
             pts, age = self._scan_mem.snapshot()
@@ -1011,7 +1109,7 @@ class BarnEnv(gym.Env):
         if (self._ref_path is None or self._ref_path_pub is None
                 or self._ref_path_pub.get_num_connections() == 0):
             return
-        header = Header(stamp=rospy.Time.now(), frame_id="base_link")
+        header = Header(stamp=rospy.Time.now(), frame_id=self._frame("base_link"))
         # World → base_link so the path needs no odom/world TF.
         dx = self._ref_path[:, 0] - x
         dy = self._ref_path[:, 1] - y
@@ -1099,8 +1197,10 @@ class BarnEnv(gym.Env):
         """Load the A* reference polyline for path-following shaping.
 
         Mirrors benchmark/benchmark_env.py: grid coordinates → Gazebo frame,
-        with the static start prepended and the goal appended. Returns None
-        when no path file exists for this world (penalty is then disabled).
+        with the static start prepended and the goal appended, then (with
+        PATH_SMOOTHING) shortened by string pulling against the world's
+        cylinders. Returns None when no path file exists for this world
+        (penalty is then disabled).
         """
         pf = WorldConfig.path_file(world_idx)
         if not os.path.exists(pf):
@@ -1116,7 +1216,13 @@ class BarnEnv(gym.Env):
                 dtype=np.float64,
             ))
         pts.append(np.array(self._goal_pos, dtype=np.float64))
-        return np.array(pts, dtype=np.float64)
+        path = np.array(pts, dtype=np.float64)
+        if RLEnvConfig.PATH_SMOOTHING:
+            world_file = WorldConfig.world_file(world_idx)
+            if os.path.exists(world_file):
+                path = shortcut_path(path, world_cylinders(world_file),
+                                     WorldConfig.OBSTACLE_RADIUS)
+        return path
 
     def _log_episode(self, outcome: str, final_dist: float):
         if not self._log_dir:
@@ -1156,6 +1262,19 @@ def _min_pool(ranges: np.ndarray, n: int) -> np.ndarray:
     return np.minimum.reduceat(ranges, edges[:-1]).astype(np.float32)
 
 
+def _is_stuck(history, window: int, min_disp: float) -> bool:
+    """True when the newest (x, y) in `history` is within `min_disp` metres of
+    the one `window` steps before it.
+
+    Net displacement, not path length or progress toward the goal: dithering
+    back and forth counts as stuck, a sideways detour does not.  False until
+    `window` steps of history exist.
+    """
+    if window <= 0 or len(history) <= window:
+        return False
+    return _dist(history[-1], history[-1 - window]) < min_disp
+
+
 def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
@@ -1164,6 +1283,35 @@ def _quat_to_yaw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _nvidia_offload_wanted() -> bool:
+    """Resolve GazeboConfig.NVIDIA_OFFLOAD ("auto" / True / False)."""
+    want = GazeboConfig.NVIDIA_OFFLOAD
+    if want != "auto":
+        return bool(want)
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return subprocess.call(
+            ["nvidia-smi", "-L"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10,
+        ) == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _gazebo_process_env(nvidia_offload: bool) -> Dict[str, str]:
+    """Environment for the Gazebo roslaunch process.
+
+    PRIME render offload sends this process's OpenGL (the gpu_ray lidar) to
+    the NVIDIA GPU while the desktop stays on the integrated one.
+    """
+    env = dict(os.environ)
+    if nvidia_offload:
+        env["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+        env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    return env
 
 
 def _find_gzserver_pid() -> Optional[int]:

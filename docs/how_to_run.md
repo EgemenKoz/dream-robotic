@@ -306,6 +306,48 @@ print({k: v for k,v in t.items()})"
 `--curriculum` overrides `--worlds`. The phase boundaries print at startup and
 each advance is logged (`[curriculum] step N: advancing to M worlds`).
 
+### Several robots in one world (faster data collection)
+
+`--n-robots N` puts N robots into the same Gazebo world and steps them
+together (`rl/env/multi_barn_env.py`). They are ghosts to each other: each has
+its own collision bit, so they drive through one another but still hit the
+obstacles, and none has rendered geometry, so no lidar sees another robot.
+Every robot therefore faces the ordinary single-robot task, and one physics
+step yields N transitions.
+
+```bash
+python3 train_sac.py --robot moborobo --curriculum --total-steps 200000 --n-robots 4
+```
+
+What differs from the single-robot path (Moborobo only):
+
+- **Lidar**: a lighter vertical profile (`RLEnvConfig.MULTI_LIDAR_PROFILE`,
+  64 samples over [−45°, 0°] instead of 900 over the full sphere). At the
+  `/scan` level it matches the stock profile to a median of 8 mm per sector.
+- **Collisions** are tested geometrically (chassis box vs. cylinder centres,
+  `rl/env/geometry.py`), not through the `/collision` topic.
+- **No `move_base`**, no camera, no collision publisher.
+- `--episodes-per-world` is per robot: the world changes after
+  `N × episodes-per-world` episodes; episodes still running are cut as
+  truncations (`outcome=world_change`, not written to `episodes.csv`).
+- `--utd` sets the gradient steps per collected transition (default 1.0, i.e.
+  N updates per vectorised step). Lower it (e.g. `--utd 0.5`) to trade sample
+  efficiency for wall-clock speed.
+- `episodes.csv` gets an extra `robot` column.
+- It refuses to start while another Gazebo server is running, instead of
+  killing it.
+
+Pick N with the capacity probe: each robot must still get its 10 Hz scan and
+the simulation must keep up with real time. On the development machine
+(RTX 2060) N=4 holds both; N=6 does not.
+
+```bash
+python3 tools/multi_probe.py capacity --n-robots 4   # scan rate, step cost, stale scans
+python3 tools/multi_probe.py ghosts                  # robots ignore each other, obstacles do not
+python3 tools/multi_probe.py compare --worlds 0 100  # light vs stock lidar, with a stock-vs-stock floor
+python3 tools/sim_probe.py                           # single-robot timing breakdown
+```
+
 ### Resume a previous run
 
 `--resume` continues training from a checkpoint. `--total-steps` is then **additional** steps (e.g. `--total-steps 100000` after a 40k checkpoint trains up to 160k total).
@@ -340,19 +382,26 @@ tail -f results/rl/runs/{RUN_ID}/episodes.csv
 
 # TensorBoard (separate terminal)
 tensorboard --logdir results/rl/runs
-# → http://localhost:6006   (watch rollout/ep_rew_mean, train/entropy_coef, train/critic_loss)
+# → http://localhost:6006   (watch rollout/ep_rew_mean, train/ent_coef, train/critic_loss, train/q_mean)
 ```
+
+Every progress line in the log ends with `q_mean`, the critic's value of the
+current policy on buffer states. It should stay within roughly
+[−50, +170]; past `2 × REWARD_GOAL` the line adds
+`[WARN] ... the critic is diverging` — stop the run and investigate.
 
 ### Key hyperparameters
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--total-steps` | 200000 | Env steps (additional steps when `--resume`) |
-| `--episodes-per-world` | 5 | Episodes before cycling to the next world |
+| `--episodes-per-world` | 5 | Episodes before moving to the next world (worlds are visited in a shuffled order, reshuffled every pass) |
+| `--curriculum-steps` | whole run | Span the three curriculum phases are laid over; keep it fixed (e.g. 300000) when extending a run with `--resume` so the phase changes stay at 100k/200k |
+| `--seed` | random | Seeds SAC and the world order; printed at startup (`Seed    : N`) so a run can be repeated |
 | `--save-every` | 20000 | Checkpoint interval (steps) |
 | `--lr` | 3e-4 | Learning rate |
 | `--batch-size` | 256 | SAC batch size |
-| `--buffer-size` | 100000 | Replay buffer capacity |
+| `--buffer-size` | 300000 | Replay buffer capacity |
 | `--ent-coef` | auto | SAC entropy coefficient |
 
 ### Deploy a trained policy in the benchmark

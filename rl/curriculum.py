@@ -162,3 +162,71 @@ def phase_for_step(phases: List[Tuple[int, List[int]]], step: int) -> List[int]:
         else:
             break
     return active
+
+
+class WorldCycler:
+    """Visits a world pool `episodes_per_world` episodes at a time.
+
+    The pool is walked in a shuffled order and reshuffled after every full
+    pass, so each world comes up once per pass but the sequence never repeats.
+    Walking it in index order (as before) meant a 214k-step run only ever saw
+    16 of its 51 starting worlds, and a curriculum phase change merely kept
+    walking the low indices of the bigger pool.
+
+    Used by MultiRobotBarnVecEnv, where the count is over the episodes of
+    every robot sharing the world, and by train_sac.WorldCyclingEnv.
+    """
+
+    def __init__(self, worlds: List[int], episodes_per_world: int = 5,
+                 seed: Optional[int] = None, shuffle: bool = True):
+        if not worlds:
+            raise ValueError("worlds must not be empty")
+        self._episodes_per_world = int(episodes_per_world)
+        self._shuffle = shuffle
+        self._rng = np.random.default_rng(seed)
+        self._worlds = list(worlds)
+        self._order = self._new_order(avoid_first=None)
+        self._ptr = 0
+        self._current = self._order[0]
+        self._done_here = 0
+
+    @property
+    def current(self) -> int:
+        return self._current
+
+    def episode_finished(self) -> bool:
+        """Count one finished episode. True when the quota for the current
+        world is used up and `advance()` should be called."""
+        self._done_here += 1
+        return self._done_here >= self._episodes_per_world
+
+    def advance(self) -> int:
+        """Move to the next world and return it."""
+        self._ptr += 1
+        if self._ptr >= len(self._order):
+            self._order = self._new_order(avoid_first=self._current)
+            self._ptr = 0
+        self._current = self._order[self._ptr]
+        self._done_here = 0
+        return self._current
+
+    def set_world_list(self, worlds: List[int]):
+        """Swap the pool (curriculum phase change). The current world keeps
+        running until its quota is used up; the next `advance()` starts a
+        fresh pass over the new pool."""
+        if worlds and list(worlds) != self._worlds:
+            self._worlds = list(worlds)
+            self._order = self._new_order(avoid_first=self._current)
+            self._ptr = -1
+
+    def _new_order(self, avoid_first: Optional[int]) -> List[int]:
+        if not self._shuffle:
+            order = list(self._worlds)
+            if avoid_first in order:
+                k = order.index(avoid_first) + 1   # carry on after the current one
+                order = order[k:] + order[:k]
+            return order
+        order = [int(w) for w in self._rng.permutation(self._worlds)]
+        if len(order) > 1 and order[0] == avoid_first:
+            order[0], order[-1] = order[-1], order[0]
+        return order

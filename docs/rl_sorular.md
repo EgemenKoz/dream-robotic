@@ -304,9 +304,9 @@ işleseydik critic "bu durumdan sonra hiçbir şey gelmez" diye öğrenirdi → 
 |---|---|---|---|
 | `learning_rate` (`--lr`) | 3e-4 | Adam optimizer'ın adım büyüklüğü (actor, critic ve α için aynı). | SAC makalesinin ve SB3'ün standart değeri. Büyütmek hızlandırır ama critic'i kararsızlaştırır. |
 | `batch_size` (`--batch-size`) | 256 | Her gradient update'te buffer'dan rastgele çekilen geçiş sayısı. | Standart. Nadir olayların (collision/unsafe) batch'e girme olasılığını belirler (bkz. §1: çarpışma %0.126 iken batch'lerin %72'si çarpışmasızdı). |
-| `buffer_size` (`--buffer-size`) | 100 000 | Replay buffer kapasitesi (FIFO). Dolunca en eski geçiş silinir. | 200k adımlık eğitimde son **100k** adım hatırlanır → eğitimin ilk yarısı unutulur. ~0.3 GB RAM. Tüm eğitimi tutmak için 200k yapılabilir (~0.6 GB). |
+| `buffer_size` (`--buffer-size`) | 300 000 (2026-10-13'e kadar 100 000) | Replay buffer kapasitesi (FIFO). Dolunca en eski geçiş silinir. | 200k adımlık eğitimde son **100k** adım hatırlanır → eğitimin ilk yarısı unutulur. ~0.3 GB RAM. Tüm eğitimi tutmak için 200k yapılabilir (~0.6 GB). |
 | `learning_starts` (`--learning-starts`) | 1 000 | İlk 1000 adımda hiç update yapılmaz, **rastgele** aksiyonla buffer doldurulur. | ≈ 1–2 episode. Başlangıçta çeşitli veri toplamak için. |
-| `gamma` γ (`--gamma`) | **0.999** | Gelecek ödüllerin indirim katsayısı. Efektif ufuk ≈ 1/(1−γ) = 1000 adım. | En kritik ayar. 0.99 → ufuk 100 adım = 10 s = **2 m**; hedef ~500 adım ötede → görünmez, robot donar. 0.999 → ufuk = episode bütçesi. Bedeli: Q-değerleri büyük ve daha gürültülü, öğrenme daha yavaş. |
+| `gamma` γ (`--gamma`) | **0.99** (2026-10-13'e kadar 0.999; o ayarda kritik Q ≈ +716'ya kaydı) | Gelecek ödüllerin indirim katsayısı. Efektif ufuk ≈ 1/(1−γ) = 100 adım. | En kritik ayar. 0.99 → ufuk 100 adım = 10 s = **2 m**; hedef ~500 adım ötede → görünmez, robot donar. 0.999 → ufuk = episode bütçesi. Bedeli: Q-değerleri büyük ve daha gürültülü, öğrenme daha yavaş. |
 | `tau` τ (`--tau`) | 0.005 | Target critic'in yumuşak güncelleme oranı: `θ_target ← τ·θ + (1−τ)·θ_target`. | Standart. Target ağ ~200 update'te yetişir; critic'i stabilize eder. |
 | `ent_coef` α (`--ent-coef`) | `auto` | Entropi (keşif) ağırlığı. `auto` → α otomatik ayarlanır ki politikanın entropisi hedefte kalsın. | Hedef entropi = −dim(A) = **−2** (SB3 varsayılanı). Sabit sayı verilebilir (örn. `0.1`). |
 | `train_freq` | 1 (SB3 default, CLI yok) | Kaç env adımında bir update. | Her adımda 1. |
@@ -376,7 +376,10 @@ işleseydik critic "bu durumdan sonra hiçbir şey gelmez" diye öğrenirdi → 
 | `PATH_FOLLOW_SHAPING` | True | A* yolundan sapma cezası açık |
 | `REWARD_PATH_SCALE` / `PATH_MAX_DEV` | 0.15 / 1.0 m | `−0.15 × min(sapma, 1)/1` |
 | `REWARD_SHAPING` | True | False → sadece step + terminal (sparse ablation) |
-| `TERMINAL_POTENTIAL_ZERO` | True | Terminalde `+12.5 × d` eklenir; shaping outcome'ları sıralayamaz |
+| `TERMINAL_POTENTIAL_ZERO` | **False** | Sadece ablation. Açıkken terminalde `+12.5 × d` eklenir ve ilerleme teşvik olmaktan çıkar |
+| `STUCK_TERMINATION` / `STUCK_WINDOW_STEPS` / `STUCK_MIN_DISPLACEMENT_M` | True / 200 / 0.3 m | 200 adımda 0.3 m'den az yer değiştirme → `stuck` terminali |
+| `REWARD_STUCK` | −50 | Stuck terminal ödülü (çarpışmayla eşit: pes etmek denemekten ucuz olmamalı) |
+| `REVERSE_SPEED_RATIO` | 0.3 | Aralık [−0.06, 0.2]; simetrik aralıkta eğitilmemiş politika yerinde titriyor |
 
 **Ölçek karşılaştırması (neyin baskın olduğu):** Bir adımda tipik değerler:
 progress **+0.25** (tam hız, hedefe doğru) · path **−0.067** (ortalama 0.45 m sapma) ·
@@ -391,7 +394,7 @@ baskın; engel dibinde prox progress ile aynı mertebeye çıkıyor — tasarım
 | `batch_size` | 64 | Minibatch; `n_steps`'i bölmeli |
 | `n_epochs` | 10 | Her rollout üzerinden kaç tur gradient |
 | `learning_rate` | 3e-4 | — |
-| `gamma` | 0.999 | SAC ile aynı gerekçe |
+| `gamma` | 0.99 | SAC ile aynı gerekçe |
 | `gae_lambda` | 0.95 | Avantaj tahmininde bias/varyans takası. Not: γ·λ ≈ 0.949 → avantaj efektif olarak ~20 adıma bakar; uzun vade value fonksiyonundan gelir. |
 | `clip_range` | 0.2 | PPO'nun politika değişim sınırı |
 | `vf_coef` | 0.5 | Value loss ağırlığı |

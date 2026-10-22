@@ -70,7 +70,7 @@ class RLLogger:
         self._recent_rewards: deque = deque(maxlen=window)
         self._recent_steps: deque = deque(maxlen=window)
         self._outcome_counts: Dict[str, int] = {
-            "success": 0, "collision": 0, "timeout": 0,
+            "success": 0, "collision": 0, "timeout": 0, "stuck": 0,
         }
         self._total_episodes = 0
         self._start_wall = time.time()
@@ -145,6 +145,7 @@ class RLLogger:
         sr = self._outcome_counts.get("success", 0) / total_done * 100
         cr = self._outcome_counts.get("collision", 0) / total_done * 100
         tr = self._outcome_counts.get("timeout", 0) / total_done * 100
+        st = self._outcome_counts.get("stuck", 0) / total_done * 100
 
         elapsed = datetime.timedelta(seconds=int(time.time() - self._start_wall))
 
@@ -152,8 +153,8 @@ class RLLogger:
             "[%s] step=%-8d ep=%-6d | "
             "reward(last %d): %.2f ± %.2f | "
             "avg_steps: %.1f | "
-            "SR %.1f%%  CR %.1f%%  TO %.1f%%"
-        ) % (elapsed, timestep, n, win, mean_r, std_r, mean_s, sr, cr, tr)
+            "SR %.1f%%  CR %.1f%%  TO %.1f%%  ST %.1f%%"
+        ) % (elapsed, timestep, n, win, mean_r, std_r, mean_s, sr, cr, tr, st)
 
         self._log_file.write(line + "\n")
         self._log_file.flush()
@@ -178,6 +179,7 @@ class RLLogger:
             "%-25s %.2f%%" % ("Success rate:", self._outcome_counts.get("success", 0) / total_done * 100),
             "%-25s %.2f%%" % ("Collision rate:", self._outcome_counts.get("collision", 0) / total_done * 100),
             "%-25s %.2f%%" % ("Timeout rate:", self._outcome_counts.get("timeout", 0) / total_done * 100),
+            "%-25s %.2f%%" % ("Stuck rate:", self._outcome_counts.get("stuck", 0) / total_done * 100),
         ]
         if self._recent_rewards:
             lines += [

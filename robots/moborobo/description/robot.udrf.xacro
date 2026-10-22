@@ -1,7 +1,57 @@
 <?xml version="1.0"?>
-    <robot xmlns:xacro="http://www.ros.org/wiki/xacro"  name="moborobo_short">        
+    <robot xmlns:xacro="http://www.ros.org/wiki/xacro"  name="moborobo_short">
+        <!--
+          All defaults reproduce the stock single-robot description.
+          barn_rl_robot.launch overrides them for multi-robot training.
+
+          visual           false removes every rendered shape, so the robot is
+                           invisible to cameras and gpu_ray lidars (its own and
+                           other robots').
+          camera           false drops the RGB camera sensor.
+          collide_bitmask  0 leaves Gazebo's default (collides with everything).
+                           Robots given different single bits pass through each
+                           other but still hit the world, whose bitmask is 0xffff.
+          lidar_*          RS-16 vertical sampling and range (urdf/RS-16.urdf.xacro).
+        -->
+        <xacro:arg name="visual"          default="true"/>
+        <xacro:arg name="camera"          default="true"/>
+        <xacro:arg name="collide_bitmask" default="0"/>
+        <xacro:arg name="lidar_v_samples" default="900"/>
+        <xacro:arg name="lidar_v_min"     default="-2.7"/>
+        <xacro:arg name="lidar_v_max"     default="2.7"/>
+        <xacro:arg name="lidar_max_range" default="150.0"/>
+
         <xacro:include filename="robot_core.xacro" />
         <xacro:include filename="controller.xacro" />
-        <xacro:include filename="camera.xacro"/>
+        <xacro:if value="$(arg camera)">
+            <xacro:include filename="camera.xacro"/>
+        </xacro:if>
         <xacro:include filename="$(find moborobo)/urdf/RS-16.urdf.xacro"/>
+
+        <xacro:property name="collide_bitmask" value="$(arg collide_bitmask)"/>
+        <xacro:macro name="ghost_collision" params="link">
+            <gazebo reference="${link}">
+                <collision>
+                    <surface>
+                        <contact>
+                            <collide_bitmask>${collide_bitmask}</collide_bitmask>
+                        </contact>
+                    </surface>
+                </collision>
+            </gazebo>
+        </xacro:macro>
+        <xacro:if value="${collide_bitmask != 0}">
+            <xacro:ghost_collision link="base_link"/>
+            <xacro:ghost_collision link="robosense_base_link"/>
+            <xacro:ghost_collision link="front_caster_1"/>
+            <xacro:ghost_collision link="front_caster_2"/>
+            <xacro:ghost_collision link="back_caster_1"/>
+            <xacro:ghost_collision link="back_caster_2"/>
+            <xacro:ghost_collision link="front_wheel_1"/>
+            <xacro:ghost_collision link="front_wheel_2"/>
+            <xacro:ghost_collision link="back_wheel_1"/>
+            <xacro:ghost_collision link="back_wheel_2"/>
+            <xacro:ghost_collision link="left_wheel"/>
+            <xacro:ghost_collision link="right_wheel"/>
+        </xacro:if>
     </robot>

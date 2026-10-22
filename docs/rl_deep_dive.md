@@ -33,8 +33,8 @@
 | Obs `scan` shape | **(4, 90)** (3 frame + 1 fresh mask) | (4, 90) | `barn_env.py:272-279` |
 | Obs `state` shape | **(5,)** | (5,) | `barn_env.py:274-279, 935-941` |
 | Algoritma | SAC (SB3), `MultiInputPolicy` | aynı | `train_sac.py:467-480` |
-| γ (gamma) | **0.999** | 0.999 | `train_sac.py:332-340` |
-| lr / batch / buffer | 3e-4 / 256 / 100 000 | aynı | `train_sac.py:328-331` |
+| γ (gamma) | **0.99** | 0.99 | `train_sac.py:332-340` |
+| lr / batch / buffer | 3e-4 / 256 / 300 000 | aynı | `train_sac.py:328-331` |
 | learning_starts | 1000 | aynı | `train_sac.py:331` |
 | Toplam step (default) | 200 000 (SAC), 500 000 (PPO) | aynı | `train_sac.py:296-299`, `train_ppo.py:186-189` |
 | Dünya başına episode | 5 | 5 | `train_sac.py:300-303` |
@@ -342,7 +342,13 @@ r = r_step + r_progress + r_prox + r_heading + r_path
 | unsafe | −40 | `+12.5 × curr_dist` | `:502-508` |
 | timeout | 0 | **uygulanmaz** | `:513-517` |
 
-### 7.3 Terminal potansiyel düzeltmesi (`TERMINAL_POTENTIAL_ZERO=True`)
+### 7.3 Terminal potansiyel düzeltmesi (`TERMINAL_POTENTIAL_ZERO`, artık kapalı)
+
+> **Güncelleme (2026-10-13):** `TERMINAL_POTENTIAL_ZERO` artık **False**, γ **0.99**, `REVERSE_SPEED_RATIO` **0.3**, buffer **300 000**, ve hareketsizlik `stuck` terminali (−25) ile bitiyor. Sebep: γ=0.999 + terminal potansiyel ile `reverse_v1` koşusunda kritik Q ≈ +716'ya kaydı (fiziksel maksimum 225), politika sıfır ortalamalı titremeye döndü. Aşağıdaki eski gerekçeler tarihçe olarak duruyor.
+
+> **Güncelleme (2026-10-14):** `REWARD_STUCK` **−50** (çarpışmayla eşit; −25'te politika engel önünde ileri-geri titreyip stuck ile bitirmeyi öğrendi). Referans path artık doğru yerde: `WorldConfig.GRID_ORIGIN = (-4.425, 5.175)` (BARN'ın dönüşümü 0.15 m / 0.10 m kaymıştı, grid hücreleri silindirlere oturtularak ölçüldü). `PATH_SMOOTHING` ile path, orijinalinden daha dar bir yerden geçmeyecek şekilde ip çekme ile kısaltılıyor (ortalama 34 → 5 nokta, 11.15 → 10.43 m).
+
+> **Güncelleme (2026-10-15):** `multi_v4` (300k) hiç başarı almadı: kritik ıraksadı (Q 20k'da +40, 300k'da +7000; buffer'daki ödüller hiç +0.35'i geçmemişti), ent_coef 0.03 → 8.7. Çözüm: kritiklerde LayerNorm (`RLModelConfig.CRITIC_LAYER_NORM`, `rl/models/critic.py`), log satırında `q_mean` ve > 200 uyarısı. Ayrıca dünyalar artık karıştırılmış sırada dolaşılıyor (`WorldCycler`); `multi_v3` sıralı dolaşım yüzünden 214k adımda 51 kolay dünyanın sadece 16'sını görmüştü. `--seed` eklendi.
 
 - Progress, potansiyel tabanlı shaping: `Φ(s) = −12.5 × d(s)`; adım terimi `Φ(s') − Φ(s)`.
   Episode boyunca toplam teleskoplanır: `Φ(s_T) − Φ(s_0)`.
@@ -413,21 +419,23 @@ state (5,)  ─ Linear(5→32) ─ReLU──────────────
 | Policy | `MultiInputPolicy` + `ScanStateExtractor` | `train_sac.py:426-429, 467-480` |
 | learning_rate | 3e-4 | `:328` |
 | batch_size | 256 | `:329` |
-| buffer_size | 100 000 | `:330` |
+| buffer_size | 300 000 | `--buffer-size` |
 | learning_starts | 1 000 | `:331` |
-| gamma | **0.999** (efektif ufuk 1/(1−γ) = 1000 adım = episode bütçesi) | `:332-340` |
+| gamma | **0.99** (ilerleme ödülü gerçek olduğu için hedefin ufukta olması gerekmiyor) | `--gamma` |
 | tau | 0.005 | `:341` |
 | ent_coef | `auto` (target entropy = −dim(A) = −2, SB3 varsayılanı) | `:342-343` |
 | train_freq / gradient_steps | 1 / 1 (SB3 varsayılanı → her env adımında 1 update) | — |
 | total_timesteps | 200 000 | `:296-299` |
 | n_envs | 1 (tek Gazebo; SB3 `DummyVecEnv`'e sarar) | `:388-395, 421` |
 
-**Neden γ = 0.999?** 10 Hz'de γ=0.99 → ufuk 100 adım = 10 s = 0.2 m/s'de **2 m**. ~500 adım
+**Neden artık γ = 0.99?** γ=0.999'da hedef `r + 0.999·Q` neredeyse hiç daralmıyor; buffer'da terminal kalmayınca Q seviyesi serbest kaldı ve +716'ya kaydı. İlerleme ödülü gerçek olunca (terminal potansiyel kapalı) 0.99 yeterli — Temmuz/Ağustos koşuları bu ayarla %47–63 başarı aldı.
+
+*Eski gerekçe (tarihçe):* 10 Hz'de γ=0.99 → ufuk 100 adım = 10 s = 0.2 m/s'de **2 m**. ~500 adım
 ötedeki hedef ödülü ~+0.7'ye iner; politika sadece dense shaping'e bakıp donar. 0.999 → 1000
 adım. (`train_sac.py:332-340`, `rl_config.py:238-241`, test `test_barn_env.py:585-603`)
 
 Replay buffer bellek tahmini: obs = 4×90 + 5 = 365 float32 = 1460 B; obs + next_obs ≈ 2.9 KB/geçiş
-→ 100k geçiş ≈ **~0.3 GB**.
+→ 300k geçiş ≈ **~0.9 GB**.
 
 ### 9.2 Dünya seçimi — `WorldCyclingEnv` (`train_sac.py:62-96`)
 
@@ -481,7 +489,7 @@ Aynı env, aynı extractor, aynı world cycling/curriculum. Farklar:
 | n_steps (rollout) | 2048 | `:216-220` |
 | batch_size | 64 | `:221-225` |
 | n_epochs | 10 | `:226-227` |
-| gamma | 0.999 | `:229-234` |
+| gamma | 0.99 | `--gamma` |
 | gae_lambda | 0.95 | `:235-237` |
 | clip_range | 0.2 | `:238-239` |
 | vf_coef / ent_coef | 0.5 / 0.01 | `:240-244` |
